@@ -1,0 +1,7 @@
+## Interface: 11507, 11508, 11509, 11510
+## Title: WoW Doom
+## Notes: A raycasting engine reimplemented in WoW's UI frame API. WASD/Arrows to move, Escape to close.
+## Author: You
+## Version: 0.1.0
+
+WoWDoom.lua
