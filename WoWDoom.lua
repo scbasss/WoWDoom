@@ -163,6 +163,36 @@ local miniPlayer = minimap:CreateTexture(nil, "OVERLAY")
 miniPlayer:SetSize(5, 5)
 miniPlayer:SetColorTexture(1, 0.2, 0.2)
 
+-- ===== Sprites: billboarded objects, depth-sorted against the wall z-buffer.
+-- A handful of decorative "torches" for now - proves out the occlusion technique
+-- that real enemies/pickups will reuse later. Unlike the wall columns, these
+-- genuinely need per-frame repositioning (their screen X and size change
+-- continuously as the player turns/moves), but there are only a few of them,
+-- so that cost is negligible next to the 72 wall columns.
+local SPRITE_SCALE = 0.45
+local SPRITES = {
+	{ x = (5 + 0.5) * CELL, y = (1 + 0.5) * CELL, color = { 1.0, 0.55, 0.15 } },
+	{ x = (3 + 0.5) * CELL, y = (3 + 0.5) * CELL, color = { 0.95, 0.30, 0.20 } },
+	{ x = (9 + 0.5) * CELL, y = (5 + 0.5) * CELL, color = { 1.0, 0.80, 0.20 } },
+	{ x = (11 + 0.5) * CELL, y = (7 + 0.5) * CELL, color = { 0.90, 0.40, 0.15 } },
+	{ x = (13 + 0.5) * CELL, y = (9 + 0.5) * CELL, color = { 1.0, 0.65, 0.10 } },
+}
+for _, sprite in ipairs(SPRITES) do
+	sprite.tex = play:CreateTexture(nil, "OVERLAY")
+	sprite.tex:SetColorTexture(sprite.color[1], sprite.color[2], sprite.color[3])
+	sprite.miniDot = minimap:CreateTexture(nil, "OVERLAY")
+	sprite.miniDot:SetSize(4, 4)
+	sprite.miniDot:SetColorTexture(sprite.color[1], sprite.color[2], sprite.color[3])
+	sprite.miniDot:SetPoint("TOPLEFT", minimap, "TOPLEFT",
+		(sprite.x / CELL) * MINI_SCALE - 2, -(sprite.y / CELL) * MINI_SCALE - 2)
+end
+
+local function NormalizeAngle(a)
+	a = a % (2 * math.pi)
+	if a > math.pi then a = a - 2 * math.pi end
+	return a
+end
+
 -- ===== Raycasting =====
 -- Fixed-step marching rather than exact DDA: at this column count and render
 -- distance the extra steps are trivial (well under a millisecond per frame),
@@ -193,6 +223,8 @@ local function TryMove(nx, ny)
 	end
 end
 
+local zbuffer = {} -- corrected wall distance per column, for sprite occlusion
+
 frame:SetScript("OnUpdate", function(self, elapsed)
 	if held.left then playerAngle = playerAngle - TURN_SPEED * elapsed end
 	if held.right then playerAngle = playerAngle + TURN_SPEED * elapsed end
@@ -212,6 +244,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		local rayAngle = playerAngle - halfFov + (i - 0.5) * (FOV / NUM_COLUMNS)
 		local dist, sideHit = CastRay(playerX, playerY, rayAngle)
 		local correctedDist = dist * cos(rayAngle - playerAngle)
+		zbuffer[i] = correctedDist
 		local wallH = min(PLAY_H, (CELL * PLAY_H) / (correctedDist + 1))
 
 		if wallH ~= col.lastH then
@@ -225,6 +258,31 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		if shadeKey ~= col.lastShadeKey then
 			col.tex:SetVertexColor(shade * 0.8, shade * 0.55, shade * 0.4)
 			col.lastShadeKey = shadeKey
+		end
+	end
+
+	for _, sprite in ipairs(SPRITES) do
+		local dx, dy = sprite.x - playerX, sprite.y - playerY
+		local dist = (dx * dx + dy * dy) ^ 0.5
+		local angleToSprite = NormalizeAngle(math.atan2(dy, dx) - playerAngle)
+
+		if dist < 1 or angleToSprite < -halfFov - 0.2 or angleToSprite > halfFov + 0.2 then
+			sprite.tex:Hide()
+		else
+			local fraction = 0.5 + angleToSprite / FOV
+			local colIndex = max(1, min(NUM_COLUMNS, floor(fraction * NUM_COLUMNS) + 1))
+
+			if dist >= (zbuffer[colIndex] or MAX_RENDER_DIST) then
+				sprite.tex:Hide()
+			else
+				local size = min(PLAY_H, (CELL * PLAY_H) / (dist + 1)) * SPRITE_SCALE
+				sprite.tex:SetSize(size, size)
+				sprite.tex:ClearAllPoints()
+				sprite.tex:SetPoint("CENTER", play, "BOTTOMLEFT", fraction * PLAY_W, PLAY_H / 2)
+				local shade = max(0.35, 1 - dist / MAX_RENDER_DIST)
+				sprite.tex:SetVertexColor(shade, shade, shade)
+				sprite.tex:Show()
+			end
 		end
 	end
 
