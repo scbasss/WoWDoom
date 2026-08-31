@@ -72,14 +72,16 @@ local LEVELS = {
 			"1111111111111111",
 		},
 		name = "The Outpost",
-		wallTint = { 0.70, 0.72, 0.78 },       -- cool neutral stone
+		wallTexture = "Interface\\AddOns\\WoWDoom\\textures\\wall_outpost.tga", -- Freedoom STONEW1
 		ceilingColor = { 0.22, 0.22, 0.26 },
 		floorColor = { 0.35, 0.32, 0.28 },
 		playerStart = { 2, 1, 0 },
 		enemySpawns = {
 			{ 5, 6, "zombie" }, { 7, 8, "zombie" }, { 5, 9, "zombie" },
 		},
-		torchSpawns = { { 5, 1 }, { 3, 3 }, { 9, 5 }, { 11, 7 }, { 13, 9 } },
+		torchSpawns = {
+			{ 5, 1, "N" }, { 3, 3, "N" }, { 9, 5, "N" }, { 11, 7, "N" }, { 13, 9, "N" },
+		},
 	},
 	{
 		mapRows = {
@@ -100,14 +102,16 @@ local LEVELS = {
 			"111111111111111111",
 		},
 		name = "The Garrison",
-		wallTint = { 0.80, 0.60, 0.42 },       -- warmer, grimier
+		wallTexture = "Interface\\AddOns\\WoWDoom\\textures\\wall_garrison.tga", -- Freedoom COMP01_1
 		ceilingColor = { 0.20, 0.17, 0.15 },
 		floorColor = { 0.30, 0.24, 0.18 },
 		playerStart = { 2, 1, 0 },
 		enemySpawns = {
 			{ 9, 3, "zombie" }, { 3, 7, "shotgunguy" }, { 13, 9, "shotgunguy" }, { 7, 11, "zombie" },
 		},
-		torchSpawns = { { 5, 1 }, { 15, 1 }, { 9, 5 }, { 3, 11 }, { 15, 9 } },
+		torchSpawns = {
+			{ 5, 1, "N" }, { 15, 1, "N" }, { 9, 5, "S" }, { 3, 11, "N" }, { 15, 9, "N" },
+		},
 	},
 	{
 		mapRows = {
@@ -130,7 +134,7 @@ local LEVELS = {
 			"11111111111111111111",
 		},
 		name = "The Pit",
-		wallTint = { 0.95, 0.32, 0.28 },       -- hellish red
+		wallTexture = "Interface\\AddOns\\WoWDoom\\textures\\wall_pit.tga", -- Freedoom HELL5_1
 		ceilingColor = { 0.16, 0.05, 0.05 },
 		floorColor = { 0.30, 0.08, 0.06 },
 		playerStart = { 2, 1, 0 },
@@ -138,7 +142,9 @@ local LEVELS = {
 			{ 9, 3, "shotgunguy" }, { 15, 5, "demon" }, { 5, 9, "demon" },
 			{ 13, 11, "demon" }, { 9, 13, "shotgunguy" },
 		},
-		torchSpawns = { { 5, 1 }, { 17, 1 }, { 3, 5 }, { 15, 9 }, { 9, 11 } },
+		torchSpawns = {
+			{ 5, 1, "N" }, { 17, 1, "N" }, { 3, 5, "E" }, { 15, 9, "S" }, { 9, 11, "S" },
+		},
 	},
 }
 
@@ -262,8 +268,9 @@ local function HideOverlay()
 end
 
 -- ===== Column pool: created once, anchored once, never re-anchored. Column count
--- doesn't depend on the map, so this (unlike the minimap/sprites/enemies below)
--- never needs to be rebuilt between levels. =====
+-- doesn't depend on the map, so the pool itself (unlike the minimap/sprites/
+-- enemies below) never needs to be rebuilt between levels - only which texture
+-- it samples from changes, set once per level load, not per frame. =====
 local columns = {}
 do
 	local colW = PLAY_W / NUM_COLUMNS
@@ -271,11 +278,11 @@ do
 		local col = {}
 		col.tex = play:CreateTexture(nil, "ARTWORK")
 		col.tex:SetWidth(colW + 1) -- +1 avoids hairline seams between columns
-		col.tex:SetColorTexture(1, 1, 1)
 		col.tex:SetPoint("CENTER", play, "BOTTOMLEFT", (i - 0.5) * colW, PLAY_H / 2)
 		col.tex:SetHeight(PLAY_H)
 		col.lastH = PLAY_H
 		col.lastShadeKey = nil
+		col.lastWallXKey = nil
 		columns[i] = col
 	end
 end
@@ -318,6 +325,14 @@ local TORCH_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\torch.tga"
 local TORCH_ASPECT = 21 / 90
 local TORCH_DOT_COLOR = { 1.0, 0.65, 0.15 }
 local TORCH_SCALE = 0.55
+-- Nudges a torch from its cell's center toward one wall face, so it reads as
+-- mounted rather than floating in the open. "N"/"S"/"E"/"W" must actually be a
+-- wall in that level's grid - verified by hand against each level's layout.
+local TORCH_WALL_OFFSET = CELL * 0.38
+local SIDE_OFFSET = {
+	N = { 0, -TORCH_WALL_OFFSET }, S = { 0, TORCH_WALL_OFFSET },
+	E = { TORCH_WALL_OFFSET, 0 }, W = { -TORCH_WALL_OFFSET, 0 },
+}
 
 -- Four monster types pulled from four different Freedoom monster slots (see
 -- textures/README.md) - real stat variety, not just reskins, so the escalation
@@ -419,16 +434,19 @@ local function CastRay(px, py, angle)
 		end
 
 		if mapX < 0 or mapY < 0 or mapX >= MAP_W or mapY >= MAP_H or MAP[mapY + 1][mapX + 1] == 1 then
-			local perpDist
+			local perpDist, wallX
 			if hitVertical then
 				perpDist = (mapX - cellX + (1 - stepX) / 2) / dirX
+				wallX = cellY + perpDist * dirY
 			else
 				perpDist = (mapY - cellY + (1 - stepY) / 2) / dirY
+				wallX = cellX + perpDist * dirX
 			end
-			return perpDist * CELL, hitVertical
+			wallX = wallX - floor(wallX) -- fractional position along the wall face, for texture sampling
+			return perpDist * CELL, hitVertical, wallX
 		end
 	end
-	return MAX_RENDER_DIST, false
+	return MAX_RENDER_DIST, false, 0
 end
 
 local function TryMove(nx, ny)
@@ -441,7 +459,6 @@ local function TryMove(nx, ny)
 end
 
 local zbuffer = {} -- corrected wall distance per column, for sprite/enemy occlusion
-local wallTint = { 0.8, 0.55, 0.4 } -- set per level by LoadLevel
 
 -- Renders one billboarded object (torch or enemy) against the current z-buffer.
 -- Shared by SPRITES and ENEMIES so occlusion/sizing math only lives in one place.
@@ -538,11 +555,16 @@ local function LoadLevel(index)
 	RebuildMinimap()
 	ceiling:SetColorTexture(unpack(def.ceilingColor))
 	floorTex:SetColorTexture(unpack(def.floorColor))
-	wallTint = def.wallTint
+	for _, col in ipairs(columns) do
+		col.tex:SetTexture(def.wallTexture)
+		col.lastShadeKey = nil   -- force a refresh next frame; the texture changed under it
+		col.lastWallXKey = nil
+	end
 
 	for _, pos in ipairs(def.torchSpawns) do
+		local offset = SIDE_OFFSET[pos[3]]
 		local sprite = {
-			x = (pos[1] + 0.5) * CELL, y = (pos[2] + 0.5) * CELL,
+			x = (pos[1] + 0.5) * CELL + offset[1], y = (pos[2] + 0.5) * CELL + offset[2],
 			color = TORCH_DOT_COLOR, texturePath = TORCH_TEXTURE,
 			aspect = TORCH_ASPECT, scale = TORCH_SCALE,
 		}
@@ -599,7 +621,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 	for i = 1, NUM_COLUMNS do
 		local col = columns[i]
 		local rayAngle = playerAngle - halfFov + (i - 0.5) * (FOV / NUM_COLUMNS)
-		local correctedDist, sideHit = CastRay(playerX, playerY, rayAngle)
+		local correctedDist, sideHit, wallX = CastRay(playerX, playerY, rayAngle)
 		zbuffer[i] = correctedDist
 		local wallH = min(PLAY_H, (CELL * PLAY_H) / (correctedDist + 1))
 
@@ -608,11 +630,21 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 			col.lastH = wallH
 		end
 
+		-- Sample a thin vertical strip of the wall texture at the hit point (the
+		-- classic raycaster texture-mapping trick), quantized so we're not calling
+		-- SetTexCoord for a difference too small to render differently anyway.
+		local wallXKey = floor(wallX * 256)
+		if wallXKey ~= col.lastWallXKey then
+			local u = wallXKey / 256
+			col.tex:SetTexCoord(u, u + 0.01, 0, 1)
+			col.lastWallXKey = wallXKey
+		end
+
 		local shade = max(0.2, 1 - correctedDist / MAX_RENDER_DIST)
 		if sideHit then shade = shade * 0.7 end
 		local shadeKey = floor(shade * 24)
 		if shadeKey ~= col.lastShadeKey then
-			col.tex:SetVertexColor(shade * wallTint[1], shade * wallTint[2], shade * wallTint[3])
+			col.tex:SetVertexColor(shade, shade, shade)
 			col.lastShadeKey = shadeKey
 		end
 	end
