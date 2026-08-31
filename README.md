@@ -2,12 +2,21 @@
 
 A raycasting engine reimplemented against World of Warcraft's UI frame API.
 
-This is **not** DOOM's code or WAD data — that's not something a WoW addon
-could run at all (no FFI, no native code execution, no external processes;
-addons are sandboxed Lua only). This is an original Wolfenstein/DOOM-style
-raycaster: a hand-built maze, cast in pure Lua, drawn as a row of flat-shaded
-vertical strips using WoW `Texture` objects — the same primitive used for
-everything else in this repo's sibling addon, [Flappy Bird](https://github.com/scbasss/FlappyBird-WoW).
+This is **not** id Software's DOOM code or game data — running actual DOOM
+data isn't something a WoW addon could do at all (no FFI, no native code
+execution, no external processes; addons are sandboxed Lua only). The engine
+is an original Wolfenstein/DOOM-style raycaster: a hand-built maze, cast in
+pure Lua, drawn as a row of shaded vertical strips using WoW `Texture`
+objects — the same primitive used for everything else in this repo's sibling
+addon, [Flappy Bird](https://github.com/scbasss/FlappyBird-WoW).
+
+Two sprites (the enemy creature and the torch decoration) are real extracted
+game-data, but from [Freedoom](https://freedoom.github.io/) — a completely
+original, BSD-licensed replacement for DOOM's WAD data, made specifically so
+projects like this don't need id's commercial (still-sold-today) art. See
+[`textures/README.md`](textures/README.md) for exactly what was taken from
+where, and `textures/FREEDOOM-LICENSE.txt` for the license that travels with
+them per its terms.
 
 ## Install
 
@@ -44,6 +53,7 @@ they all converge on:
 
 ## Status
 
-Early and actively evolving — currently a walkable maze with working
-collision. Sprites (billboarded objects, depth-sorted against the walls) and
-a HUD are next.
+Early and actively evolving. Currently: a walkable maze with wall collision,
+enemies with chase AI/contact damage/gunfire, a HP bar and death/respawn, and
+real sprite art for the enemy and torch decorations (see above). Multiple
+levels with progression between them are next.

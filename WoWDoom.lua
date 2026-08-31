@@ -218,7 +218,12 @@ miniPlayer:SetColorTexture(1, 0.2, 0.2)
 -- genuinely need per-frame repositioning (their screen X and size change
 -- continuously as the player turns/moves), but there are only a few of them,
 -- so that cost is negligible next to the 72 wall columns.
-local SPRITE_SCALE = 0.45
+-- Torch sprite (Freedoom TREDA0, see textures/README.md for provenance/license) is
+-- 21x90 source pixels - tall and thin, so it needs its own aspect ratio rather than
+-- the square billboards everything used before real sprite art existed.
+local TORCH_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\torch.tga"
+local TORCH_ASPECT = 21 / 90
+local SPRITE_SCALE = 0.55
 local SPRITES = {
 	{ x = (5 + 0.5) * CELL, y = (1 + 0.5) * CELL, color = { 1.0, 0.55, 0.15 } },
 	{ x = (3 + 0.5) * CELL, y = (3 + 0.5) * CELL, color = { 0.95, 0.30, 0.20 } },
@@ -226,6 +231,10 @@ local SPRITES = {
 	{ x = (11 + 0.5) * CELL, y = (7 + 0.5) * CELL, color = { 0.90, 0.40, 0.15 } },
 	{ x = (13 + 0.5) * CELL, y = (9 + 0.5) * CELL, color = { 1.0, 0.65, 0.10 } },
 }
+for _, sprite in ipairs(SPRITES) do
+	sprite.texturePath = TORCH_TEXTURE
+	sprite.aspect = TORCH_ASPECT
+end
 local function CreateBillboardVisuals(obj, dotSize)
 	obj.tex = play:CreateTexture(nil, "OVERLAY")
 	if obj.texturePath then
@@ -258,9 +267,15 @@ local ENEMIES = {
 	{ x = (7 + 0.5) * CELL, y = (8 + 0.5) * CELL, color = { 0.75, 0.1, 0.65 } },
 	{ x = (5 + 0.5) * CELL, y = (9 + 0.5) * CELL, color = { 0.75, 0.1, 0.65 } },
 }
+-- Enemy sprite is Freedoom TROOA1 (the "imp" slot's monster - Freedoom uses original
+-- creature designs, not id Software's actual Imp), 48x60 source pixels.
+local ENEMY_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\creature.tga"
+local ENEMY_ASPECT = 48 / 60
+
 for _, enemy in ipairs(ENEMIES) do
-	enemy.scale = 0.7
-	enemy.texturePath = "Interface\\AddOns\\WoWDoom\\textures\\imp.tga"
+	enemy.scale = 0.85
+	enemy.texturePath = ENEMY_TEXTURE
+	enemy.aspect = ENEMY_ASPECT
 	enemy.hp = ENEMY_MAX_HP
 	enemy.dead = false
 	enemy.hitFlash = 0
@@ -373,8 +388,9 @@ local function UpdateBillboard(obj, halfFov)
 		return
 	end
 
-	local size = min(PLAY_H, (CELL * PLAY_H) / (dist + 1)) * (obj.scale or SPRITE_SCALE)
-	obj.tex:SetSize(size, size)
+	local height = min(PLAY_H, (CELL * PLAY_H) / (dist + 1)) * (obj.scale or SPRITE_SCALE)
+	local width = height * (obj.aspect or 1)
+	obj.tex:SetSize(width, height)
 	obj.tex:ClearAllPoints()
 	obj.tex:SetPoint("CENTER", play, "BOTTOMLEFT", fraction * PLAY_W, PLAY_H / 2)
 
