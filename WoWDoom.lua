@@ -21,9 +21,8 @@ local PLAY_W, PLAY_H   = 520, 340
 local NUM_COLUMNS      = 72
 local FOV              = math.rad(66)
 local CELL             = 64          -- world units per map cell
-local MAX_STEPS        = 40
-local STEP_SIZE        = CELL / 4
-local MAX_RENDER_DIST  = MAX_STEPS * STEP_SIZE
+local MAX_STEPS        = 24          -- max grid-cell boundaries a ray may cross (DDA advances ~1 cell/step)
+local MAX_RENDER_DIST  = MAX_STEPS * CELL
 local MOVE_SPEED       = 130         -- world units / sec
 local TURN_SPEED       = 2.6         -- radians / sec
 local PLAYER_RADIUS    = 12
@@ -131,8 +130,8 @@ hpBarFill:SetPoint("BOTTOMLEFT", hpBarBG, "BOTTOMLEFT", 2, 2)
 hpBarFill:SetWidth(196)
 hpBarFill:SetColorTexture(0.75, 0.15, 0.15)
 
-local hpText = hpBarBG:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-hpText:SetPoint("CENTER")
+local hpText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+hpText:SetPoint("CENTER", hpBarBG, "CENTER")
 
 local function UpdateHPBar()
 	local pct = max(0, playerHP / PLAYER_MAX_HP)
@@ -262,6 +261,14 @@ for _, enemy in ipairs(ENEMIES) do
 	PositionMiniDot(enemy, 5)
 end
 
+-- All billboarded objects together, so they can be depth-sorted as one set -
+-- otherwise an enemy would always paint over a torch (or vice versa) regardless
+-- of which is actually closer, since WoW draws same-layer textures in creation
+-- order by default, not by distance.
+local ALL_BILLBOARDS = {}
+for _, sprite in ipairs(SPRITES) do tinsert(ALL_BILLBOARDS, sprite) end
+for _, enemy in ipairs(ENEMIES) do tinsert(ALL_BILLBOARDS, enemy) end
+
 local function NormalizeAngle(a)
 	a = a % (2 * math.pi)
 	if a > math.pi then a = a - 2 * math.pi end
@@ -269,21 +276,56 @@ local function NormalizeAngle(a)
 end
 
 -- ===== Raycasting =====
--- Fixed-step marching rather than exact DDA: at this column count and render
--- distance the extra steps are trivial (well under a millisecond per frame),
--- and it's much easier to get right than exact grid-DDA edge cases.
+-- Exact DDA (Lode Vandevenne's classic algorithm - the reference nearly every
+-- JS/C raycaster, including Wolfenstein 3D itself, is built on): step precisely
+-- to the next grid-cell boundary each iteration instead of marching in small
+-- fixed increments. Cheaper (fewer iterations) and exact (can't step over a
+-- thin wall), and it yields the fisheye-corrected perpendicular distance
+-- directly - no separate cos() correction needed afterward.
+local INF = 1e30
+
 local function CastRay(px, py, angle)
 	local dirX, dirY = cos(angle), sin(angle)
-	local dist = 0
+	local cellX, cellY = px / CELL, py / CELL
+	local mapX, mapY = floor(cellX), floor(cellY)
+
+	local deltaDistX = (dirX == 0) and INF or math.abs(1 / dirX)
+	local deltaDistY = (dirY == 0) and INF or math.abs(1 / dirY)
+
+	local stepX, sideDistX
+	if dirX < 0 then
+		stepX, sideDistX = -1, (cellX - mapX) * deltaDistX
+	else
+		stepX, sideDistX = 1, (mapX + 1 - cellX) * deltaDistX
+	end
+
+	local stepY, sideDistY
+	if dirY < 0 then
+		stepY, sideDistY = -1, (cellY - mapY) * deltaDistY
+	else
+		stepY, sideDistY = 1, (mapY + 1 - cellY) * deltaDistY
+	end
+
+	local hitVertical = false
 	for _ = 1, MAX_STEPS do
-		dist = dist + STEP_SIZE
-		local rx, ry = px + dirX * dist, py + dirY * dist
-		if IsWall(rx, ry) then
-			local fracX = (rx % CELL) / CELL
-			local fracY = (ry % CELL) / CELL
-			local distToVerticalEdge = min(fracX, 1 - fracX)
-			local distToHorizontalEdge = min(fracY, 1 - fracY)
-			return dist, distToVerticalEdge < distToHorizontalEdge
+		if sideDistX < sideDistY then
+			sideDistX = sideDistX + deltaDistX
+			mapX = mapX + stepX
+			hitVertical = true
+		else
+			sideDistY = sideDistY + deltaDistY
+			mapY = mapY + stepY
+			hitVertical = false
+		end
+
+		if mapX < 0 or mapY < 0 or mapX >= MAP_W or mapY >= MAP_H or MAP[mapY + 1][mapX + 1] == 1 then
+			local perpDist
+			if hitVertical then
+				perpDist = (mapX - cellX + (1 - stepX) / 2) / dirX
+			else
+				perpDist = (mapY - cellY + (1 - stepY) / 2) / dirY
+			end
+			return perpDist * CELL, hitVertical
 		end
 	end
 	return MAX_RENDER_DIST, false
@@ -389,8 +431,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 	for i = 1, NUM_COLUMNS do
 		local col = columns[i]
 		local rayAngle = playerAngle - halfFov + (i - 0.5) * (FOV / NUM_COLUMNS)
-		local dist, sideHit = CastRay(playerX, playerY, rayAngle)
-		local correctedDist = dist * cos(rayAngle - playerAngle)
+		local correctedDist, sideHit = CastRay(playerX, playerY, rayAngle)
 		zbuffer[i] = correctedDist
 		local wallH = min(PLAY_H, (CELL * PLAY_H) / (correctedDist + 1))
 
@@ -420,11 +461,21 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 	end
 	UpdateHPBar()
 
-	for _, sprite in ipairs(SPRITES) do
-		UpdateBillboard(sprite, halfFov)
+	-- Depth-sort every billboard together (farthest first) and paint in that
+	-- order via draw-layer sublevels, so a nearer torch correctly covers a
+	-- farther enemy (or vice versa) instead of it being decided by creation order.
+	for _, obj in ipairs(ALL_BILLBOARDS) do
+		if obj.dead then
+			obj._dist = -1
+		else
+			local dx, dy = obj.x - playerX, obj.y - playerY
+			obj._dist = (dx * dx + dy * dy) ^ 0.5
+		end
 	end
-	for _, enemy in ipairs(ENEMIES) do
-		UpdateBillboard(enemy, halfFov)
+	table.sort(ALL_BILLBOARDS, function(a, b) return a._dist > b._dist end)
+	for idx, obj in ipairs(ALL_BILLBOARDS) do
+		obj.tex:SetDrawLayer("OVERLAY", max(-8, min(7, -8 + (idx - 1))))
+		UpdateBillboard(obj, halfFov)
 	end
 
 	miniPlayer:ClearAllPoints()
