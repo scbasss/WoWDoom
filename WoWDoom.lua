@@ -433,6 +433,11 @@ helpText:SetText("WASD / Arrows to move + turn. Space / click to shoot.")
 local levelText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 levelText:SetPoint("TOPRIGHT", -30, -18)
 
+-- TEMPORARY debug readout - remove once the riser/layer stacking is confirmed working.
+local debugText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+debugText:SetPoint("TOP", levelText, "BOTTOM", 0, -4)
+debugText:SetTextColor(0.4, 1, 0.4)
+
 -- Health bar
 local hpBarBG = frame:CreateTexture(nil, "ARTWORK")
 hpBarBG:SetSize(200, 14)
@@ -830,6 +835,16 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		local col = columns[i]
 		local rayAngle = playerAngle - halfFov + (i - 0.5) * (FOV / NUM_COLUMNS)
 		local wallLayers, finalDist = CastRayLines(playerX, playerY, rayAngle, currentLines, currentSectors, playerSectorIdx)
+
+		if i == floor(NUM_COLUMNS / 2) then
+			local parts = {}
+			for li, w in ipairs(wallLayers) do
+				tinsert(parts, ("#%d:d=%d z%d-%d"):format(li, floor(w.dist), floor(w.zBottom), floor(w.zTop)))
+			end
+			debugText:SetText(("sector=%d eyeZ=%.0f layers=%d [%s]"):format(
+				playerSectorIdx, eyeZ, #wallLayers, table.concat(parts, " ")))
+		end
+
 		-- Sprite/enemy occlusion uses the distance to the ultimate solid stop, not
 		-- the nearest layer's distance - a riser only covers part of the column's
 		-- height, so it shouldn't hide a creature standing in the room beyond/above
