@@ -33,12 +33,9 @@ local PLAYER_RADIUS    = 12
 local EXIT_RADIUS      = CELL * 0.6
 
 local PLAYER_MAX_HP    = 100
-local ENEMY_MAX_HP     = 100
-local ENEMY_SPEED      = 70
 local ENEMY_RADIUS     = 14
 local ENEMY_DETECT_RADIUS = 260
 local ENEMY_STOP_DIST  = 45
-local ENEMY_CONTACT_DPS = 18
 local SHOOT_RANGE      = MAX_RENDER_DIST
 local SHOOT_CONE       = 0.12        -- radians either side of center
 local SHOOT_DAMAGE     = 34
@@ -74,8 +71,14 @@ local LEVELS = {
 			"1011111010111101",
 			"1111111111111111",
 		},
+		name = "The Outpost",
+		wallTint = { 0.70, 0.72, 0.78 },       -- cool neutral stone
+		ceilingColor = { 0.22, 0.22, 0.26 },
+		floorColor = { 0.35, 0.32, 0.28 },
 		playerStart = { 2, 1, 0 },
-		enemySpawns = { { 5, 6 }, { 7, 8 }, { 5, 9 } },
+		enemySpawns = {
+			{ 5, 6, "zombie" }, { 7, 8, "zombie" }, { 5, 9, "zombie" },
+		},
 		torchSpawns = { { 5, 1 }, { 3, 3 }, { 9, 5 }, { 11, 7 }, { 13, 9 } },
 	},
 	{
@@ -96,8 +99,14 @@ local LEVELS = {
 			"100000000000000201",
 			"111111111111111111",
 		},
+		name = "The Garrison",
+		wallTint = { 0.80, 0.60, 0.42 },       -- warmer, grimier
+		ceilingColor = { 0.20, 0.17, 0.15 },
+		floorColor = { 0.30, 0.24, 0.18 },
 		playerStart = { 2, 1, 0 },
-		enemySpawns = { { 9, 3 }, { 3, 7 }, { 13, 9 }, { 7, 11 } },
+		enemySpawns = {
+			{ 9, 3, "zombie" }, { 3, 7, "shotgunguy" }, { 13, 9, "shotgunguy" }, { 7, 11, "zombie" },
+		},
 		torchSpawns = { { 5, 1 }, { 15, 1 }, { 9, 5 }, { 3, 11 }, { 15, 9 } },
 	},
 	{
@@ -120,8 +129,15 @@ local LEVELS = {
 			"10000000000000000201",
 			"11111111111111111111",
 		},
+		name = "The Pit",
+		wallTint = { 0.95, 0.32, 0.28 },       -- hellish red
+		ceilingColor = { 0.16, 0.05, 0.05 },
+		floorColor = { 0.30, 0.08, 0.06 },
 		playerStart = { 2, 1, 0 },
-		enemySpawns = { { 9, 3 }, { 15, 5 }, { 5, 9 }, { 13, 11 }, { 9, 13 } },
+		enemySpawns = {
+			{ 9, 3, "shotgunguy" }, { 15, 5, "demon" }, { 5, 9, "demon" },
+			{ 13, 11, "demon" }, { 9, 13, "shotgunguy" },
+		},
 		torchSpawns = { { 5, 1 }, { 17, 1 }, { 3, 5 }, { 15, 9 }, { 9, 11 } },
 	},
 }
@@ -212,18 +228,17 @@ play:SetPoint("BOTTOM", 0, 20)
 if play.SetClipsChildren then play:SetClipsChildren(true) end
 play:EnableMouse(true)
 
--- Ceiling / floor: static, drawn once, never touched again.
+-- Ceiling / floor: anchored once; color is re-set per level (LoadLevel) for the
+-- thematic escalation (cool stone -> grimy -> hellish red), never touched per-frame.
 local ceiling = play:CreateTexture(nil, "BACKGROUND")
 ceiling:SetPoint("TOPLEFT")
 ceiling:SetPoint("TOPRIGHT")
 ceiling:SetHeight(PLAY_H / 2)
-ceiling:SetColorTexture(0.22, 0.22, 0.26)
 
 local floorTex = play:CreateTexture(nil, "BACKGROUND")
 floorTex:SetPoint("BOTTOMLEFT")
 floorTex:SetPoint("BOTTOMRIGHT")
 floorTex:SetHeight(PLAY_H / 2)
-floorTex:SetColorTexture(0.35, 0.32, 0.28)
 
 -- Overlay messages: death/retry and level-complete/win, same layout, different text.
 local bigMsg = play:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
@@ -298,17 +313,38 @@ miniPlayer:SetColorTexture(1, 0.2, 0.2)
 -- ===== Billboards: torches (SPRITES) and monsters (ENEMIES), depth-sorted together
 -- (ALL_BILLBOARDS) against the wall z-buffer each frame. Rebuilt per level. =====
 -- Torch sprite is Freedoom TREDA0 (see textures/README.md), 21x90 source pixels -
--- tall and thin, hence its own aspect ratio. Enemy sprite is Freedoom TROOA1 (the
--- "imp" slot's own original creature design, not id's actual Imp), 48x60 pixels.
+-- tall and thin, hence its own aspect ratio.
 local TORCH_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\torch.tga"
 local TORCH_ASPECT = 21 / 90
 local TORCH_DOT_COLOR = { 1.0, 0.65, 0.15 }
 local TORCH_SCALE = 0.55
 
-local ENEMY_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\creature.tga"
-local ENEMY_ASPECT = 48 / 60
+-- Four monster types pulled from four different Freedoom monster slots (see
+-- textures/README.md) - real stat variety, not just reskins, so the escalation
+-- across levels (weak -> mixed -> dangerous) is felt, not just seen.
 local ENEMY_DOT_COLOR = { 0.75, 0.1, 0.65 }
-local ENEMY_SCALE = 0.85
+local ENEMY_TYPES = {
+	zombie = {
+		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\zombie.tga", -- Freedoom POSSA1
+		aspect = 41 / 57, scale = 0.85,
+		maxHP = 55, speed = 55, contactDPS = 10,
+	},
+	shotgunguy = {
+		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\shotgunguy.tga", -- Freedoom SPOSA1
+		aspect = 35 / 55, scale = 0.85,
+		maxHP = 90, speed = 65, contactDPS = 16,
+	},
+	creature = {
+		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\creature.tga", -- Freedoom TROOA1
+		aspect = 48 / 60, scale = 0.85,
+		maxHP = 100, speed = 70, contactDPS = 18,
+	},
+	demon = {
+		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\demon.tga", -- Freedoom SARGA1
+		aspect = 38 / 59, scale = 0.9,
+		maxHP = 130, speed = 100, contactDPS = 24,
+	},
+}
 
 local function CreateBillboardVisuals(obj, dotSize)
 	obj.tex = play:CreateTexture(nil, "OVERLAY")
@@ -405,6 +441,7 @@ local function TryMove(nx, ny)
 end
 
 local zbuffer = {} -- corrected wall distance per column, for sprite/enemy occlusion
+local wallTint = { 0.8, 0.55, 0.4 } -- set per level by LoadLevel
 
 -- Renders one billboarded object (torch or enemy) against the current z-buffer.
 -- Shared by SPRITES and ENEMIES so occlusion/sizing math only lives in one place.
@@ -464,11 +501,11 @@ local function UpdateEnemyAI(enemy, elapsed)
 
 	if dist < ENEMY_DETECT_RADIUS then
 		if dist > ENEMY_STOP_DIST then
-			local nx = enemy.x + (dx / dist) * ENEMY_SPEED * elapsed
-			local ny = enemy.y + (dy / dist) * ENEMY_SPEED * elapsed
+			local nx = enemy.x + (dx / dist) * enemy.speed * elapsed
+			local ny = enemy.y + (dy / dist) * enemy.speed * elapsed
 			TryMoveEnemy(enemy, nx, ny)
 		else
-			playerHP = playerHP - ENEMY_CONTACT_DPS * elapsed
+			playerHP = playerHP - enemy.contactDPS * elapsed
 		end
 	end
 
@@ -499,6 +536,9 @@ local function LoadLevel(index)
 		end
 	end
 	RebuildMinimap()
+	ceiling:SetColorTexture(unpack(def.ceilingColor))
+	floorTex:SetColorTexture(unpack(def.floorColor))
+	wallTint = def.wallTint
 
 	for _, pos in ipairs(def.torchSpawns) do
 		local sprite = {
@@ -512,12 +552,14 @@ local function LoadLevel(index)
 		tinsert(ALL_BILLBOARDS, sprite)
 	end
 
-	for _, pos in ipairs(def.enemySpawns) do
+	for _, spawn in ipairs(def.enemySpawns) do
+		local etype = ENEMY_TYPES[spawn[3]]
 		local enemy = {
-			x = (pos[1] + 0.5) * CELL, y = (pos[2] + 0.5) * CELL,
-			color = ENEMY_DOT_COLOR, texturePath = ENEMY_TEXTURE,
-			aspect = ENEMY_ASPECT, scale = ENEMY_SCALE,
-			hp = ENEMY_MAX_HP, dead = false, hitFlash = 0,
+			x = (spawn[1] + 0.5) * CELL, y = (spawn[2] + 0.5) * CELL,
+			color = ENEMY_DOT_COLOR, texturePath = etype.texturePath,
+			aspect = etype.aspect, scale = etype.scale,
+			speed = etype.speed, contactDPS = etype.contactDPS,
+			hp = etype.maxHP, maxHP = etype.maxHP, dead = false, hitFlash = 0,
 		}
 		enemy.spawnX, enemy.spawnY = enemy.x, enemy.y
 		CreateBillboardVisuals(enemy, 5)
@@ -530,7 +572,7 @@ local function LoadLevel(index)
 	playerAngle = def.playerStart[3] or 0
 	playerHP = PLAYER_MAX_HP
 	UpdateHPBar()
-	levelText:SetText(("Level %d / %d"):format(index, #LEVELS))
+	levelText:SetText(("%s (Level %d / %d)"):format(def.name, index, #LEVELS))
 
 	HideOverlay()
 	gameState = "playing"
@@ -570,7 +612,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		if sideHit then shade = shade * 0.7 end
 		local shadeKey = floor(shade * 24)
 		if shadeKey ~= col.lastShadeKey then
-			col.tex:SetVertexColor(shade * 0.8, shade * 0.55, shade * 0.4)
+			col.tex:SetVertexColor(shade * wallTint[1], shade * wallTint[2], shade * wallTint[3])
 			col.lastShadeKey = shadeKey
 		end
 	end
