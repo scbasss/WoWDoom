@@ -852,15 +852,17 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		-- check either, so this is the more sensible approximation of the two.
 		zbuffer[i] = finalDist
 
-		-- Each layer's height is computed from ITS OWN true distance (so farther
-		-- layers correctly look smaller/compressed), but a layer's SCREEN
-		-- POSITION is pinned to sit directly on top of the previous one rather
-		-- than computed independently - independent per-layer centering left a
-		-- gap (or worse, a disconnected floating slice) wherever the two
-		-- distances didn't happen to agree, which is what "still a half wall"
-		-- was actually showing: the far room was there, just not lined up
-		-- with the riser beneath it.
-		local prevTopY = nil
+		-- All layers in a column's stack share ONE projection distance (the
+		-- nearest hit) for SIZE/POSITION, rather than each using its own true
+		-- distance. Real per-pixel distance (DOOM's visplanes) isn't buildable
+		-- on this rendering primitive at all - one Texture per column, no
+		-- per-row sampling - so this is the best available substitute: with a
+		-- shared distance, two touching z-ranges (e.g. a riser's [0,32] and its
+		-- continuation's [32,64]) provably land at the exact same screen Y with
+		-- no gap, since both derive from the same projection scale. Shading
+		-- still uses each layer's OWN true distance, so farther parts still
+		-- read as farther via darkening even though not via a size cliff.
+		local stackDist = wallLayers[1] and wallLayers[1].dist or MAX_RENDER_DIST
 		for l = 1, LAYERS_PER_COLUMN do
 			local layer = col.layers[l]
 			local w = wallLayers[l]
@@ -875,9 +877,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 					layer.shown = true
 				end
 
-				local naturalCenterY, wallH = ComputeSlice(w.dist, w.zBottom, w.zTop, eyeZ)
-				local centerY = prevTopY and (prevTopY + wallH / 2) or naturalCenterY
-				prevTopY = centerY + wallH / 2
+				local centerY, wallH = ComputeSlice(stackDist, w.zBottom, w.zTop, eyeZ)
 
 				if wallH ~= layer.lastH then
 					layer.tex:SetHeight(wallH)
