@@ -487,7 +487,10 @@ local function NormalizeAngle(a)
 end
 
 local function TryMove(nx, ny)
-	if not IsWall(nx + PLAYER_RADIUS, ny) and not IsWall(nx - PLAYER_RADIUS, ny) then
+	-- Each axis is tested against the OTHER axis's current (committed) position,
+	-- not the candidate one - decoupling them lets the player slide along a wall
+	-- at an inside corner instead of both checks failing together and locking up.
+	if not IsWall(nx + PLAYER_RADIUS, playerY) and not IsWall(nx - PLAYER_RADIUS, playerY) then
 		playerX = nx
 	end
 	if not IsWall(playerX, ny + PLAYER_RADIUS) and not IsWall(playerX, ny - PLAYER_RADIUS) then
@@ -537,7 +540,8 @@ local function UpdateBillboard(obj, halfFov)
 end
 
 local function TryMoveEnemy(enemy, nx, ny)
-	if not IsWall(nx + ENEMY_RADIUS, ny) and not IsWall(nx - ENEMY_RADIUS, ny) then
+	local curY = enemy.y
+	if not IsWall(nx + ENEMY_RADIUS, curY) and not IsWall(nx - ENEMY_RADIUS, curY) then
 		enemy.x = nx
 	end
 	if not IsWall(enemy.x, ny + ENEMY_RADIUS) and not IsWall(enemy.x, ny - ENEMY_RADIUS) then
