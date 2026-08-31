@@ -11,16 +11,17 @@ commercial game's copyrighted WAD. id's original sprite/texture art is not
 used anywhere in this addon and isn't freely licensed - only Freedoom's
 original replacement designs are.
 
-| File                | Source lump | What it is                                                     |
-|---------------------|-------------|-------------------------------------------------------------------|
-| `torch.tga`         | `TREDA0`    | Freedoom's burning red torch decoration                           |
-| `creature.tga`      | `TROOA1`    | Freedoom's monster for the "imp" slot (its own original design)   |
-| `zombie.tga`        | `POSSA1`    | Freedoom's monster for the "zombieman" slot                       |
-| `shotgunguy.tga`    | `SPOSA1`    | Freedoom's monster for the "shotgun guy" slot                     |
-| `demon.tga`         | `SARGA1`    | Freedoom's monster for the "demon/pinky" slot                     |
-| `wall_outpost.tga`  | `STONEW1`   | Wall texture, Level 1 (The Outpost) - stone/brick                 |
-| `wall_garrison.tga` | `COMP01_1`  | Wall texture, Level 2 (The Garrison) - computer panel              |
-| `wall_pit.tga`      | `HELL5_1`   | Wall texture, Level 3 (The Pit) - organic hellish rock             |
+| File                                        | Source lump(s)          | What it is                                                     |
+|---------------------------------------------|--------------------------|-------------------------------------------------------------------|
+| `torch.tga`                                 | `TREDA0`                | Freedoom's burning red torch decoration                           |
+| `creature_1..4.tga`                         | `TROOA1/B1/C1/D1`       | Walk-cycle frames, "imp" slot monster (its own original design)   |
+| `zombie_1..4.tga`                           | `POSSA1/B1/C1/D1`       | Walk-cycle frames, "zombieman" slot monster                       |
+| `shotgunguy_1..4.tga`                       | `SPOSA1/B1/C1/D1`       | Walk-cycle frames, "shotgun guy" slot monster                     |
+| `demon_1..4.tga`                            | `SARGA1/B1/C1/D1`       | Walk-cycle frames, "demon/pinky" slot monster                     |
+| `wall_outpost.tga`                          | `STONEW1`                | Wall texture, Level 1 (The Outpost) - stone/brick                 |
+| `wall_garrison.tga`                         | `COMP01_1`               | Wall texture, Level 2 (The Garrison) - computer panel              |
+| `wall_pit.tga`                              | `HELL5_1`                | Wall texture, Level 3 (The Pit) - organic hellish rock             |
+| `pistol_idle/fire1/fire2.tga`, `pistol_flash.tga` | `PISGA0/B0/C0`, `PISFA0` | First-person weapon viewmodel + muzzle flash                |
 
 Extracted with a small custom WAD/picture-format parser (DOOM's picture format
 stores images as columns of RLE-ish "posts" against the `PLAYPAL` palette;

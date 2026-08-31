@@ -500,6 +500,64 @@ local function HideOverlay()
 	subMsg:Hide()
 end
 
+-- ===== Weapon viewmodel: Freedoom's pistol (PISGA0-C0 + PISFA0 muzzle flash).
+-- Fixed HUD element anchored to the bottom of the play area, not part of the
+-- 3D scene - always on top of every billboard regardless of depth-sort order
+-- (sublevel 7, above the -8..-1 range billboards use). =====
+local WEAPON_FRAMES = {
+	"Interface\\AddOns\\WoWDoom\\textures\\pistol_idle.tga",
+	"Interface\\AddOns\\WoWDoom\\textures\\pistol_fire1.tga",
+	"Interface\\AddOns\\WoWDoom\\textures\\pistol_fire2.tga",
+}
+local WEAPON_FLASH_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\pistol_flash.tga"
+local WEAPON_ASPECT = 82 / 92 -- pistol_idle.tga dimensions
+local WEAPON_PHASE_DURATION = 0.08 -- seconds per fire-animation frame
+
+local weaponTex = play:CreateTexture(nil, "OVERLAY", nil, 7)
+do
+	local w = PLAY_W * 0.46
+	weaponTex:SetSize(w, w / WEAPON_ASPECT)
+	weaponTex:SetPoint("BOTTOM", play, "BOTTOM", 0, -6)
+	weaponTex:SetTexture(WEAPON_FRAMES[1])
+end
+
+local weaponFlashTex = play:CreateTexture(nil, "OVERLAY", nil, 6) -- just behind the gun itself
+do
+	local w = PLAY_W * 0.3
+	weaponFlashTex:SetSize(w, w)
+	weaponFlashTex:SetPoint("BOTTOM", weaponTex, "TOP", -PLAY_W * 0.05, -w * 0.35)
+	weaponFlashTex:SetTexture(WEAPON_FLASH_TEXTURE)
+	weaponFlashTex:Hide()
+end
+
+local weaponFiring = false
+local weaponAnimTime = 0
+
+local function FireWeaponAnim()
+	weaponFiring = true
+	weaponAnimTime = 0
+end
+
+local function UpdateWeaponAnim(elapsed)
+	if not weaponFiring then return end
+	weaponAnimTime = weaponAnimTime + elapsed
+	local phase = floor(weaponAnimTime / WEAPON_PHASE_DURATION) -- 0,1,2,3...
+
+	if phase >= #WEAPON_FRAMES then
+		weaponFiring = false
+		weaponTex:SetTexture(WEAPON_FRAMES[1])
+		weaponFlashTex:Hide()
+		return
+	end
+
+	weaponTex:SetTexture(WEAPON_FRAMES[phase + 1])
+	if phase == 0 then
+		weaponFlashTex:Show()
+	else
+		weaponFlashTex:Hide()
+	end
+end
+
 -- ===== Column pool: each column is up to LAYERS_PER_COLUMN stacked texture
 -- slices (e.g. a riser plus the far wall beyond/above it), so steps/platforms
 -- actually composite instead of just replacing what's behind them. Every
@@ -586,35 +644,77 @@ local SIDE_OFFSET = {
 -- textures/README.md) - real stat variety, not just reskins, so the escalation
 -- across levels (weak -> mixed -> dangerous) is felt, not just seen.
 local ENEMY_DOT_COLOR = { 0.75, 0.1, 0.65 }
+-- Each monster gets its real 4-frame DOOM walk cycle (A1/B1/C1/D1 - the
+-- standard walk-animation frame set every DOOM monster ships) instead of one
+-- static pose. Only animates while actually chasing (see UpdateEnemyAI) -
+-- frame 1 doubles as the idle pose.
+local FRAME_DURATION = 0.14 -- seconds per walk-cycle frame
 local ENEMY_TYPES = {
 	zombie = {
-		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\zombie.tga", -- Freedoom POSSA1
+		frames = {
+			"Interface\\AddOns\\WoWDoom\\textures\\zombie_1.tga", "Interface\\AddOns\\WoWDoom\\textures\\zombie_2.tga",
+			"Interface\\AddOns\\WoWDoom\\textures\\zombie_3.tga", "Interface\\AddOns\\WoWDoom\\textures\\zombie_4.tga",
+		}, -- Freedoom POSSA1-D1
 		aspect = 41 / 57, scale = 0.85,
 		maxHP = 55, speed = 55, contactDPS = 10,
 	},
 	shotgunguy = {
-		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\shotgunguy.tga", -- Freedoom SPOSA1
+		frames = {
+			"Interface\\AddOns\\WoWDoom\\textures\\shotgunguy_1.tga", "Interface\\AddOns\\WoWDoom\\textures\\shotgunguy_2.tga",
+			"Interface\\AddOns\\WoWDoom\\textures\\shotgunguy_3.tga", "Interface\\AddOns\\WoWDoom\\textures\\shotgunguy_4.tga",
+		}, -- Freedoom SPOSA1-D1
 		aspect = 35 / 55, scale = 0.85,
 		maxHP = 90, speed = 65, contactDPS = 16,
 	},
 	creature = {
-		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\creature.tga", -- Freedoom TROOA1
+		frames = {
+			"Interface\\AddOns\\WoWDoom\\textures\\creature_1.tga", "Interface\\AddOns\\WoWDoom\\textures\\creature_2.tga",
+			"Interface\\AddOns\\WoWDoom\\textures\\creature_3.tga", "Interface\\AddOns\\WoWDoom\\textures\\creature_4.tga",
+		}, -- Freedoom TROOA1-D1
 		aspect = 48 / 60, scale = 0.85,
 		maxHP = 100, speed = 70, contactDPS = 18,
 	},
 	demon = {
-		texturePath = "Interface\\AddOns\\WoWDoom\\textures\\demon.tga", -- Freedoom SARGA1
+		frames = {
+			"Interface\\AddOns\\WoWDoom\\textures\\demon_1.tga", "Interface\\AddOns\\WoWDoom\\textures\\demon_2.tga",
+			"Interface\\AddOns\\WoWDoom\\textures\\demon_3.tga", "Interface\\AddOns\\WoWDoom\\textures\\demon_4.tga",
+		}, -- Freedoom SARGA1-D1
 		aspect = 38 / 59, scale = 0.9,
 		maxHP = 130, speed = 100, contactDPS = 24,
 	},
 }
 
+-- Every billboard carries a `frames` list (torches just have one - same code
+-- path either way, so anything could get an animation later for free, e.g. a
+-- flickering torch, without touching this function again).
 local function CreateBillboardVisuals(obj, dotSize)
 	obj.tex = play:CreateTexture(nil, "OVERLAY")
-	obj.tex:SetTexture(obj.texturePath)
+	obj.animTime = 0
+	obj.frameIdx = 1
+	obj.tex:SetTexture(obj.frames[1])
 	obj.miniDot = minimap:CreateTexture(nil, "OVERLAY")
 	obj.miniDot:SetSize(dotSize, dotSize)
 	obj.miniDot:SetColorTexture(obj.color[1], obj.color[2], obj.color[3])
+end
+
+-- Advances obj's walk-cycle frame if it's supposed to be animating right now;
+-- always resets to frame 1 (the idle pose) when not. Swaps SetTexture only on
+-- an actual frame change (same dirty-check discipline as everything else here).
+local function AdvanceBillboardAnim(obj, elapsed, animating)
+	if not animating or #obj.frames <= 1 then
+		obj.animTime = 0
+		if obj.frameIdx ~= 1 then
+			obj.frameIdx = 1
+			obj.tex:SetTexture(obj.frames[1])
+		end
+		return
+	end
+	obj.animTime = obj.animTime + elapsed
+	local idx = floor(obj.animTime / FRAME_DURATION) % #obj.frames + 1
+	if idx ~= obj.frameIdx then
+		obj.frameIdx = idx
+		obj.tex:SetTexture(obj.frames[idx])
+	end
 end
 
 local function PositionMiniDot(obj, dotSize)
@@ -718,9 +818,10 @@ local function UpdateEnemyAI(enemy, elapsed)
 
 	local dx, dy = playerX - enemy.x, playerY - enemy.y
 	local dist = (dx * dx + dy * dy) ^ 0.5
+	local isChasing = dist < ENEMY_DETECT_RADIUS and dist > ENEMY_STOP_DIST
 
 	if dist < ENEMY_DETECT_RADIUS then
-		if dist > ENEMY_STOP_DIST then
+		if isChasing then
 			local nx = enemy.x + (dx / dist) * enemy.speed * elapsed
 			local ny = enemy.y + (dy / dist) * enemy.speed * elapsed
 			TryMoveEnemy(enemy, nx, ny)
@@ -729,6 +830,7 @@ local function UpdateEnemyAI(enemy, elapsed)
 		end
 	end
 
+	AdvanceBillboardAnim(enemy, elapsed, isChasing)
 	PositionMiniDot(enemy, 5)
 end
 
@@ -771,7 +873,7 @@ local function LoadLevel(index)
 		local offset = SIDE_OFFSET[pos[3]]
 		local sprite = {
 			x = (pos[1] + 0.5) * CELL + offset[1], y = (pos[2] + 0.5) * CELL + offset[2],
-			color = TORCH_DOT_COLOR, texturePath = TORCH_TEXTURE,
+			color = TORCH_DOT_COLOR, frames = { TORCH_TEXTURE },
 			aspect = TORCH_ASPECT, scale = TORCH_SCALE,
 		}
 		CreateBillboardVisuals(sprite, 4)
@@ -784,7 +886,7 @@ local function LoadLevel(index)
 		local etype = ENEMY_TYPES[spawn[3]]
 		local enemy = {
 			x = (spawn[1] + 0.5) * CELL, y = (spawn[2] + 0.5) * CELL,
-			color = ENEMY_DOT_COLOR, texturePath = etype.texturePath,
+			color = ENEMY_DOT_COLOR, frames = etype.frames,
 			aspect = etype.aspect, scale = etype.scale,
 			speed = etype.speed, contactDPS = etype.contactDPS,
 			hp = etype.maxHP, maxHP = etype.maxHP, dead = false, hitFlash = 0,
@@ -803,6 +905,10 @@ local function LoadLevel(index)
 	UpdateHPBar()
 	levelText:SetText(("%s (Level %d / %d)"):format(def.name, index, #LEVELS))
 
+	weaponFiring = false
+	weaponTex:SetTexture(WEAPON_FRAMES[1])
+	weaponFlashTex:Hide()
+
 	HideOverlay()
 	gameState = "playing"
 end
@@ -811,6 +917,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 	if gameState ~= "playing" then return end
 
 	if shootCooldown > 0 then shootCooldown = shootCooldown - elapsed end
+	UpdateWeaponAnim(elapsed)
 
 	if held.left then playerAngle = playerAngle - TURN_SPEED * elapsed end
 	if held.right then playerAngle = playerAngle + TURN_SPEED * elapsed end
@@ -959,6 +1066,7 @@ end)
 local function Shoot()
 	if gameState ~= "playing" or shootCooldown > 0 then return end
 	shootCooldown = SHOOT_COOLDOWN
+	FireWeaponAnim()
 
 	local halfFov = FOV / 2
 	local bestEnemy, bestDist = nil, math.huge
