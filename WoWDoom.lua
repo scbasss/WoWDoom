@@ -23,6 +23,10 @@
 local FRAME_W, FRAME_H = 560, 470
 local PLAY_W, PLAY_H   = 520, 340
 local NUM_COLUMNS      = 72
+-- Matches MAX_PORTAL_DEPTH below (each portal hop can add at most one layer, so
+-- that's the real worst case) - keep these two in lockstep or CastRayLines can
+-- silently return more layers than there are texture slots to draw them in.
+local LAYERS_PER_COLUMN = 4
 local FOV              = math.rad(66)
 local CELL             = 64          -- world units per map cell
 local RENDER_DIST_CELLS = 24          -- draw distance, in cells, before a ray just fades to nothing
@@ -300,20 +304,21 @@ local function RayIntersectSegment(ox, oy, dx, dy, ax, ay, bx, by)
 	return nil
 end
 
--- Casts through open portals (equal-or-descending floor height) instead of
--- stopping at the first line, up to MAX_PORTAL_DEPTH sector crossings, so you
--- can see through doorways into adjacent same/lower-height rooms - exactly
--- DOOM's "open" case. An ascending-floor portal (a platform ahead) is treated
--- as closed FROM THIS SIDE and rendered as the step's riser face (this is the
--- one deliberate simplification vs. real DOOM: we draw either the riser OR the
--- far wall beyond it, never both composited in one column - true multi-layer
--- per-column compositing, plus per-sector floor/ceiling shading (visplanes),
--- are the remaining pieces if we ever want to go further than this).
+-- Casts through open portals (equal-or-descending floor height) to see into
+-- adjacent rooms, exactly DOOM's "open" case. An ascending-floor portal (a
+-- platform ahead) records a riser layer (the step's face) but - unlike the
+-- first version of this - does NOT stop the ray there: it keeps walking into
+-- the far sector, so a column can end up with several layers (e.g. a riser
+-- plus the far wall beyond/above it), composited near-to-far by the caller.
+-- Returns the layer list and the distance to the ultimate solid stop (used for
+-- sprite/enemy occlusion - see the zbuffer comment at the call site for why
+-- that's the more useful value there than the nearest layer's distance).
 local function CastRayLines(px, py, angle, lines, sectors, startSectorIdx)
 	local dirX, dirY = cos(angle), sin(angle)
 	local ox, oy = px, py
 	local traveled = 0
 	local curSectorIdx = startSectorIdx
+	local layers = {}
 
 	for _ = 1, MAX_PORTAL_DEPTH do
 		local bestT, bestLine = MAX_RENDER_DIST, nil
@@ -325,7 +330,7 @@ local function CastRayLines(px, py, angle, lines, sectors, startSectorIdx)
 		end
 
 		if not bestLine then
-			return MAX_RENDER_DIST, false, 0, sectors[curSectorIdx]
+			return layers, traveled + MAX_RENDER_DIST
 		end
 
 		-- NOT the "a and b or c" idiom here: bestLine[7] can legitimately be
@@ -340,22 +345,30 @@ local function CastRayLines(px, py, angle, lines, sectors, startSectorIdx)
 		local _, wallX = RayIntersectSegment(ox, oy, dirX, dirY, bestLine[1], bestLine[2], bestLine[3], bestLine[4])
 		local totalDist = traveled + bestT
 
-		if not otherIdx then -- solid: one side is a wall
-			return totalDist, bestLine[5], wallX, sectors[curSectorIdx]
+		if not otherIdx then -- solid: one side is a wall - final layer, ray stops here
+			local sector = sectors[curSectorIdx]
+			tinsert(layers, {
+				dist = totalDist, isVertical = bestLine[5], wallX = wallX,
+				zBottom = sector.floor, zTop = sector.ceiling,
+			})
+			return layers, totalDist
 		end
 
 		local nearSector, farSector = sectors[curSectorIdx], sectors[otherIdx]
-		if farSector.floor > nearSector.floor then -- ascending step: closed from this side, draw the riser
-			return totalDist, bestLine[5], wallX, nearSector, farSector.floor
+		if farSector.floor > nearSector.floor then -- ascending step: record the riser face, keep going
+			tinsert(layers, {
+				dist = totalDist, isVertical = bestLine[5], wallX = wallX,
+				zBottom = nearSector.floor, zTop = farSector.floor,
+			})
 		end
+		-- level or descending: fully open, no layer to draw for this crossing at all
 
-		-- level or descending: open, keep going into the far sector
 		ox, oy = ox + dirX * (bestT + 0.01), oy + dirY * (bestT + 0.01)
 		traveled = totalDist
 		curSectorIdx = otherIdx
 	end
 
-	return MAX_RENDER_DIST, false, 0, sectors[curSectorIdx]
+	return layers, traveled + MAX_RENDER_DIST
 end
 
 -- Projects a world-space vertical span [zBottom, zTop] (e.g. a sector's floor to
@@ -482,29 +495,37 @@ local function HideOverlay()
 	subMsg:Hide()
 end
 
--- ===== Column pool: created once, anchored once, never re-anchored. Column count
--- doesn't depend on the map, so the pool itself (unlike the minimap/sprites/
--- enemies below) never needs to be rebuilt between levels - only which texture
--- it samples from changes, set once per level load, not per frame. =====
--- Columns still only need SetPoint touched when their vertical CENTER actually
--- moves (dirty-checked, like height/color/texcoord below) - not "anchor once
--- forever" anymore, since a riser/platform hit or a change in the player's own
--- eye height (standing on a platform) both shift where a slice sits vertically,
--- not just how tall it is. Still cheap at NUM_COLUMNS=72.
+-- ===== Column pool: each column is up to LAYERS_PER_COLUMN stacked texture
+-- slices (e.g. a riser plus the far wall beyond/above it), so steps/platforms
+-- actually composite instead of just replacing what's behind them. Every
+-- layer's texture is created once; column count and layer count don't depend
+-- on the map, so the pool itself never needs rebuilding between levels - only
+-- which wall texture it samples from, set once per level load.
+--
+-- Each layer's SetPoint is touched only when its vertical CENTER actually
+-- moves (dirty-checked, like height/color/texcoord) - not anchored forever,
+-- since a riser or a change in the player's own eye height (standing on a
+-- platform) shifts where a slice sits, not just how tall it is. Still cheap
+-- at NUM_COLUMNS * LAYERS_PER_COLUMN = 216 texture objects.
 local columns = {}
 do
 	local colW = PLAY_W / NUM_COLUMNS
 	for i = 1, NUM_COLUMNS do
-		local col = {}
-		col.x = (i - 0.5) * colW
-		col.tex = play:CreateTexture(nil, "ARTWORK")
-		col.tex:SetWidth(colW + 1) -- +1 avoids hairline seams between columns
-		col.tex:SetPoint("CENTER", play, "BOTTOMLEFT", col.x, PLAY_H / 2)
-		col.tex:SetHeight(PLAY_H)
-		col.lastH = PLAY_H
-		col.lastCenterYKey = floor((PLAY_H / 2) * 4)
-		col.lastShadeKey = nil
-		col.lastWallXKey = nil
+		local col = { x = (i - 0.5) * colW, layers = {} }
+		for l = 1, LAYERS_PER_COLUMN do
+			local layer = {}
+			layer.tex = play:CreateTexture(nil, "ARTWORK", nil, LAYERS_PER_COLUMN - l) -- nearer layers drawn on top
+			layer.tex:SetWidth(colW + 1) -- +1 avoids hairline seams between columns
+			layer.tex:SetPoint("CENTER", play, "BOTTOMLEFT", col.x, PLAY_H / 2)
+			layer.tex:SetHeight(PLAY_H)
+			layer.tex:Hide()
+			layer.lastH = PLAY_H
+			layer.lastCenterYKey = floor((PLAY_H / 2) * 4)
+			layer.lastShadeKey = nil
+			layer.lastWallXKey = nil
+			layer.shown = false
+			col.layers[l] = layer
+		end
 		columns[i] = col
 	end
 end
@@ -734,9 +755,11 @@ local function LoadLevel(index)
 	ceiling:SetColorTexture(unpack(def.ceilingColor))
 	floorTex:SetColorTexture(unpack(def.floorColor))
 	for _, col in ipairs(columns) do
-		col.tex:SetTexture(def.wallTexture)
-		col.lastShadeKey = nil   -- force a refresh next frame; the texture changed under it
-		col.lastWallXKey = nil
+		for _, layer in ipairs(col.layers) do
+			layer.tex:SetTexture(def.wallTexture)
+			layer.lastShadeKey = nil -- force a refresh next frame; the texture changed under it
+			layer.lastWallXKey = nil
+		end
 	end
 
 	for _, pos in ipairs(def.torchSpawns) do
@@ -806,40 +829,59 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 	for i = 1, NUM_COLUMNS do
 		local col = columns[i]
 		local rayAngle = playerAngle - halfFov + (i - 0.5) * (FOV / NUM_COLUMNS)
-		local correctedDist, sideHit, wallX, hitSector, riserTop =
-			CastRayLines(playerX, playerY, rayAngle, currentLines, currentSectors, playerSectorIdx)
-		zbuffer[i] = correctedDist
+		local wallLayers, finalDist = CastRayLines(playerX, playerY, rayAngle, currentLines, currentSectors, playerSectorIdx)
+		-- Sprite/enemy occlusion uses the distance to the ultimate solid stop, not
+		-- the nearest layer's distance - a riser only covers part of the column's
+		-- height, so it shouldn't hide a creature standing in the room beyond/above
+		-- it. Our billboards don't yet have their own per-pixel vertical extent
+		-- check either, so this is the more sensible approximation of the two.
+		zbuffer[i] = finalDist
 
-		local zBottom, zTop = hitSector.floor, riserTop or hitSector.ceiling
-		local centerY, wallH = ComputeSlice(correctedDist, zBottom, zTop, eyeZ)
+		for l = 1, LAYERS_PER_COLUMN do
+			local layer = col.layers[l]
+			local w = wallLayers[l]
+			if not w then
+				if layer.shown then
+					layer.tex:Hide()
+					layer.shown = false
+				end
+			else
+				if not layer.shown then
+					layer.tex:Show()
+					layer.shown = true
+				end
 
-		if wallH ~= col.lastH then
-			col.tex:SetHeight(wallH)
-			col.lastH = wallH
-		end
-		local centerYKey = floor(centerY * 4)
-		if centerYKey ~= col.lastCenterYKey then
-			col.tex:ClearAllPoints()
-			col.tex:SetPoint("CENTER", play, "BOTTOMLEFT", col.x, centerY)
-			col.lastCenterYKey = centerYKey
-		end
+				local centerY, wallH = ComputeSlice(w.dist, w.zBottom, w.zTop, eyeZ)
 
-		-- Sample a thin vertical strip of the wall texture at the hit point (the
-		-- classic raycaster texture-mapping trick), quantized so we're not calling
-		-- SetTexCoord for a difference too small to render differently anyway.
-		local wallXKey = floor(wallX * 256)
-		if wallXKey ~= col.lastWallXKey then
-			local u = wallXKey / 256
-			col.tex:SetTexCoord(u, u + 0.01, 0, 1)
-			col.lastWallXKey = wallXKey
-		end
+				if wallH ~= layer.lastH then
+					layer.tex:SetHeight(wallH)
+					layer.lastH = wallH
+				end
+				local centerYKey = floor(centerY * 4)
+				if centerYKey ~= layer.lastCenterYKey then
+					layer.tex:ClearAllPoints()
+					layer.tex:SetPoint("CENTER", play, "BOTTOMLEFT", col.x, centerY)
+					layer.lastCenterYKey = centerYKey
+				end
 
-		local shade = max(0.2, 1 - correctedDist / MAX_RENDER_DIST)
-		if sideHit then shade = shade * 0.7 end
-		local shadeKey = floor(shade * 24)
-		if shadeKey ~= col.lastShadeKey then
-			col.tex:SetVertexColor(shade, shade, shade)
-			col.lastShadeKey = shadeKey
+				-- Sample a thin vertical strip of the wall texture at the hit point
+				-- (the classic raycaster texture-mapping trick), quantized so we're
+				-- not calling SetTexCoord for a difference too small to matter.
+				local wallXKey = floor(w.wallX * 256)
+				if wallXKey ~= layer.lastWallXKey then
+					local u = wallXKey / 256
+					layer.tex:SetTexCoord(u, u + 0.01, 0, 1)
+					layer.lastWallXKey = wallXKey
+				end
+
+				local shade = max(0.2, 1 - w.dist / MAX_RENDER_DIST)
+				if w.isVertical then shade = shade * 0.7 end
+				local shadeKey = floor(shade * 24)
+				if shadeKey ~= layer.lastShadeKey then
+					layer.tex:SetVertexColor(shade, shade, shade)
+					layer.lastShadeKey = shadeKey
+				end
+			end
 		end
 	end
 
