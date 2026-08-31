@@ -837,6 +837,15 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		-- check either, so this is the more sensible approximation of the two.
 		zbuffer[i] = finalDist
 
+		-- Each layer's height is computed from ITS OWN true distance (so farther
+		-- layers correctly look smaller/compressed), but a layer's SCREEN
+		-- POSITION is pinned to sit directly on top of the previous one rather
+		-- than computed independently - independent per-layer centering left a
+		-- gap (or worse, a disconnected floating slice) wherever the two
+		-- distances didn't happen to agree, which is what "still a half wall"
+		-- was actually showing: the far room was there, just not lined up
+		-- with the riser beneath it.
+		local prevTopY = nil
 		for l = 1, LAYERS_PER_COLUMN do
 			local layer = col.layers[l]
 			local w = wallLayers[l]
@@ -851,7 +860,9 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 					layer.shown = true
 				end
 
-				local centerY, wallH = ComputeSlice(w.dist, w.zBottom, w.zTop, eyeZ)
+				local naturalCenterY, wallH = ComputeSlice(w.dist, w.zBottom, w.zTop, eyeZ)
+				local centerY = prevTopY and (prevTopY + wallH / 2) or naturalCenterY
+				prevTopY = centerY + wallH / 2
 
 				if wallH ~= layer.lastH then
 					layer.tex:SetHeight(wallH)
