@@ -1,19 +1,23 @@
--- WoW Doom: a raycasting engine reimplemented against WoW's UI frame API.
--- This is NOT DOOM's code or WAD data (that couldn't run in the addon sandbox
--- at all - no FFI, no native code, no external processes). It's an original
--- Wolfenstein/DOOM-style raycaster: a hand-built maze, cast in Lua, drawn as a
--- row of flat-shaded vertical strips (WoW Textures), same as everything else
--- in this AddOns folder.
+-- WoW Doom: a raycasting engine reimplemented against World of Warcraft's UI frame API.
+-- This is NOT id Software's DOOM code or game data (that couldn't run in the addon
+-- sandbox at all - no FFI, no native code, no external processes). The engine is an
+-- original Wolfenstein/DOOM-style raycaster: hand-built mazes, cast in Lua, drawn as
+-- shaded vertical strips using WoW Textures - the same primitive used for everything
+-- else in this AddOns folder. Two sprites (enemy creature, torch) are real extracted
+-- Freedoom art (BSD-licensed original replacement game-data, not id's) - see
+-- textures/README.md for exactly what was taken from where.
 --
--- Performance approach (learned from how other "DOOM on constrained surfaces"
--- ports actually stay usable, e.g. the DOOM-on-Google-Sheets project explicitly
--- rendering low-res and only touching cells that changed):
+-- Performance approach (learned from how other "DOOM on constrained surfaces" ports
+-- actually stay usable, e.g. the DOOM-on-Google-Sheets project explicitly rendering
+-- low-res and only touching cells that changed):
 --   1. Low column count (one Texture per screen column) instead of real pixel
 --      resolution - this is the actual cost driver, not the ray math.
---   2. Each column's Texture is anchored ONCE, by its center, and never
---      re-anchored. Every frame we only ever call SetHeight/SetVertexColor,
---      and only when the value actually changed since last frame.
---   3. Flat-shaded walls (distance + side shading), no per-pixel texturing.
+--   2. Each column's Texture is anchored ONCE, by its center, and never re-anchored.
+--      Every frame we only ever call SetHeight/SetVertexColor, and only when the
+--      value actually changed since last frame.
+--   3. Depth-sorted billboards (sublevel per distance rank) instead of per-pixel
+--      compositing, and exact DDA raycasting (Lode Vandevenne's classic algorithm)
+--      instead of fixed-step marching.
 
 -- ===== Config =====
 local FRAME_W, FRAME_H = 560, 470
@@ -26,6 +30,7 @@ local MAX_RENDER_DIST  = MAX_STEPS * CELL
 local MOVE_SPEED       = 130         -- world units / sec
 local TURN_SPEED       = 2.6         -- radians / sec
 local PLAYER_RADIUS    = 12
+local EXIT_RADIUS      = CELL * 0.6
 
 local PLAYER_MAX_HP    = 100
 local ENEMY_MAX_HP     = 100
@@ -41,30 +46,87 @@ local SHOOT_COOLDOWN   = 0.35        -- seconds between shots
 
 local cos, sin, floor, min, max = math.cos, math.sin, math.floor, math.min, math.max
 
--- ===== Map: a small hand-built maze. 1 = wall, 0 = open. Not derived from any WAD. =====
-local MAP_ROWS = {
-	"1111111111111111",
-	"1000000000000001",
-	"1011110111011101",
-	"1010000100010001",
-	"1010111101110101",
-	"1000100000000101",
-	"1110101111110101",
-	"1000101000000101",
-	"1011101011111101",
-	"1000001010000001",
-	"1011111010111101",
-	"1111111111111111",
-}
-local MAP_W, MAP_H = #MAP_ROWS[1], #MAP_ROWS
-
-local MAP = {}
-for y = 1, MAP_H do
-	MAP[y] = {}
-	for x = 1, MAP_W do
-		MAP[y][x] = tonumber(MAP_ROWS[y]:sub(x, x))
-	end
+local function ClearArray(t)
+	for i = #t, 1, -1 do t[i] = nil end
 end
+
+-- ===== Levels =====
+-- Each level is its own hand-built maze (original layouts, not extracted DOOM/Freedoom
+-- map data - see the README for why: our engine is a uniform-grid raycaster on purpose,
+-- and real DOOM levels aren't grid-shaped, so importing them would mean either mangling
+-- them unrecognizably or rewriting this into a full sector/BSP engine). Structurally
+-- this mirrors how DOOM source ports like ZDoom define progression (a MAPINFO lump
+-- saying which map follows which) - just simple enough to be a plain Lua table.
+-- '1' = wall, '0' = open floor, '2' = exit (walkable; reaching it advances the level).
+local LEVELS = {
+	{
+		mapRows = {
+			"1111111111111111",
+			"1000000000000001",
+			"1011110111011101",
+			"1010000100010001",
+			"1010111101110101",
+			"1000100000000101",
+			"1110101111110101",
+			"1000101000000101",
+			"1011101011111101",
+			"1000001010000201",
+			"1011111010111101",
+			"1111111111111111",
+		},
+		playerStart = { 2, 1, 0 },
+		enemySpawns = { { 5, 6 }, { 7, 8 }, { 5, 9 } },
+		torchSpawns = { { 5, 1 }, { 3, 3 }, { 9, 5 }, { 11, 7 }, { 13, 9 } },
+	},
+	{
+		mapRows = {
+			"111111111111111111",
+			"100000001100000001",
+			"101110101101110101",
+			"101000101000010101",
+			"101011101011110101",
+			"100010000010000001",
+			"111010111110111101",
+			"100010100000101001",
+			"101110101110101101",
+			"100000100010001001",
+			"101111101010101101",
+			"100000001010001001",
+			"101110111010111101",
+			"100000000000000201",
+			"111111111111111111",
+		},
+		playerStart = { 2, 1, 0 },
+		enemySpawns = { { 9, 3 }, { 3, 7 }, { 13, 9 }, { 7, 11 } },
+		torchSpawns = { { 5, 1 }, { 15, 1 }, { 9, 5 }, { 3, 11 }, { 15, 9 } },
+	},
+	{
+		mapRows = {
+			"11111111111111111111",
+			"10000000000000000001",
+			"10111110111110111101",
+			"10100010001000010101",
+			"10101110101011110101",
+			"10101000101010000101",
+			"10101011101010111101",
+			"10001010001000100001",
+			"11101010111011101011",
+			"10001000100010001001",
+			"10111011101110111101",
+			"10100010001000010101",
+			"10101110111110101101",
+			"10000010000010000001",
+			"10111010111010111101",
+			"10000000000000000201",
+			"11111111111111111111",
+		},
+		playerStart = { 2, 1, 0 },
+		enemySpawns = { { 9, 3 }, { 15, 5 }, { 5, 9 }, { 13, 11 }, { 9, 13 } },
+		torchSpawns = { { 5, 1 }, { 17, 1 }, { 3, 5 }, { 15, 9 }, { 9, 11 } },
+	},
+}
+
+local MAP, MAP_W, MAP_H -- current level; rebuilt by LoadLevel()
 
 local function IsWall(worldX, worldY)
 	local cx = floor(worldX / CELL) + 1
@@ -73,13 +135,13 @@ local function IsWall(worldX, worldY)
 	return MAP[cy][cx] == 1
 end
 
--- ===== Player state =====
-local PLAYER_START_X, PLAYER_START_Y = (2 + 0.5) * CELL, (1 + 0.5) * CELL
-local playerX, playerY = PLAYER_START_X, PLAYER_START_Y
-local playerAngle = 0
+-- ===== Player / run state =====
+local playerX, playerY, playerAngle = 0, 0, 0
 local playerHP = PLAYER_MAX_HP
-local gameState = "playing" -- playing | dead
+local gameState = "playing" -- playing | dead | levelcomplete | won
 local shootCooldown = 0
+local currentLevelIndex = 1
+local levelExitX, levelExitY = 0, 0
 
 local held = { forward = false, back = false, left = false, right = false }
 
@@ -117,6 +179,9 @@ closeBtn:SetPoint("TOPRIGHT", -4, -4)
 local helpText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 helpText:SetPoint("TOP", title, "BOTTOM", 0, -4)
 helpText:SetText("WASD / Arrows to move + turn. Space / click to shoot.")
+
+local levelText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+levelText:SetPoint("TOPRIGHT", -30, -18)
 
 -- Health bar
 local hpBarBG = frame:CreateTexture(nil, "ARTWORK")
@@ -160,18 +225,30 @@ floorTex:SetPoint("BOTTOMRIGHT")
 floorTex:SetHeight(PLAY_H / 2)
 floorTex:SetColorTexture(0.35, 0.32, 0.28)
 
--- Death / restart overlay
-local deathMsg = play:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
-deathMsg:SetPoint("CENTER")
-deathMsg:SetText("You Died")
-deathMsg:Hide()
+-- Overlay messages: death/retry and level-complete/win, same layout, different text.
+local bigMsg = play:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+bigMsg:SetPoint("CENTER")
+bigMsg:Hide()
 
-local deathSubMsg = play:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-deathSubMsg:SetPoint("TOP", deathMsg, "BOTTOM", 0, -10)
-deathSubMsg:SetText("Click or press Space to respawn")
-deathSubMsg:Hide()
+local subMsg = play:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+subMsg:SetPoint("TOP", bigMsg, "BOTTOM", 0, -10)
+subMsg:Hide()
 
--- ===== Column pool: created once, anchored once, never re-anchored. =====
+local function ShowOverlay(big, sub)
+	bigMsg:SetText(big)
+	subMsg:SetText(sub)
+	bigMsg:Show()
+	subMsg:Show()
+end
+
+local function HideOverlay()
+	bigMsg:Hide()
+	subMsg:Hide()
+end
+
+-- ===== Column pool: created once, anchored once, never re-anchored. Column count
+-- doesn't depend on the map, so this (unlike the minimap/sprites/enemies below)
+-- never needs to be rebuilt between levels. =====
 local columns = {}
 do
 	local colW = PLAY_W / NUM_COLUMNS
@@ -188,15 +265,19 @@ do
 	end
 end
 
--- ===== Minimap (debug aid: cheap, drawn once except the player marker) =====
+-- ===== Minimap: frame created once; size + wall cells rebuilt per level. =====
 local MINI_SCALE = 4
 local minimap = CreateFrame("Frame", nil, frame)
-minimap:SetSize(MAP_W * MINI_SCALE, MAP_H * MINI_SCALE)
 minimap:SetPoint("TOPLEFT", play, "TOPLEFT", 6, -6)
-do
-	local bg = minimap:CreateTexture(nil, "BACKGROUND")
-	bg:SetAllPoints()
-	bg:SetColorTexture(0, 0, 0, 0.5)
+local minimapBG = minimap:CreateTexture(nil, "BACKGROUND")
+minimapBG:SetAllPoints()
+minimapBG:SetColorTexture(0, 0, 0, 0.5)
+local minimapWallCells = {}
+
+local function RebuildMinimap()
+	minimap:SetSize(MAP_W * MINI_SCALE, MAP_H * MINI_SCALE)
+	for _, cell in ipairs(minimapWallCells) do cell:Hide() end
+	ClearArray(minimapWallCells)
 	for y = 1, MAP_H do
 		for x = 1, MAP_W do
 			if MAP[y][x] == 1 then
@@ -204,47 +285,34 @@ do
 				cell:SetSize(MINI_SCALE, MINI_SCALE)
 				cell:SetPoint("TOPLEFT", minimap, "TOPLEFT", (x - 1) * MINI_SCALE, -(y - 1) * MINI_SCALE)
 				cell:SetColorTexture(0.7, 0.7, 0.75)
+				tinsert(minimapWallCells, cell)
 			end
 		end
 	end
 end
+
 local miniPlayer = minimap:CreateTexture(nil, "OVERLAY")
 miniPlayer:SetSize(5, 5)
 miniPlayer:SetColorTexture(1, 0.2, 0.2)
 
--- ===== Sprites: billboarded objects, depth-sorted against the wall z-buffer.
--- A handful of decorative "torches" for now - proves out the occlusion technique
--- that real enemies/pickups will reuse later. Unlike the wall columns, these
--- genuinely need per-frame repositioning (their screen X and size change
--- continuously as the player turns/moves), but there are only a few of them,
--- so that cost is negligible next to the 72 wall columns.
--- Torch sprite (Freedoom TREDA0, see textures/README.md for provenance/license) is
--- 21x90 source pixels - tall and thin, so it needs its own aspect ratio rather than
--- the square billboards everything used before real sprite art existed.
+-- ===== Billboards: torches (SPRITES) and monsters (ENEMIES), depth-sorted together
+-- (ALL_BILLBOARDS) against the wall z-buffer each frame. Rebuilt per level. =====
+-- Torch sprite is Freedoom TREDA0 (see textures/README.md), 21x90 source pixels -
+-- tall and thin, hence its own aspect ratio. Enemy sprite is Freedoom TROOA1 (the
+-- "imp" slot's own original creature design, not id's actual Imp), 48x60 pixels.
 local TORCH_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\torch.tga"
 local TORCH_ASPECT = 21 / 90
-local SPRITE_SCALE = 0.55
-local SPRITES = {
-	{ x = (5 + 0.5) * CELL, y = (1 + 0.5) * CELL, color = { 1.0, 0.55, 0.15 } },
-	{ x = (3 + 0.5) * CELL, y = (3 + 0.5) * CELL, color = { 0.95, 0.30, 0.20 } },
-	{ x = (9 + 0.5) * CELL, y = (5 + 0.5) * CELL, color = { 1.0, 0.80, 0.20 } },
-	{ x = (11 + 0.5) * CELL, y = (7 + 0.5) * CELL, color = { 0.90, 0.40, 0.15 } },
-	{ x = (13 + 0.5) * CELL, y = (9 + 0.5) * CELL, color = { 1.0, 0.65, 0.10 } },
-}
-for _, sprite in ipairs(SPRITES) do
-	sprite.texturePath = TORCH_TEXTURE
-	sprite.aspect = TORCH_ASPECT
-end
+local TORCH_DOT_COLOR = { 1.0, 0.65, 0.15 }
+local TORCH_SCALE = 0.55
+
+local ENEMY_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\creature.tga"
+local ENEMY_ASPECT = 48 / 60
+local ENEMY_DOT_COLOR = { 0.75, 0.1, 0.65 }
+local ENEMY_SCALE = 0.85
+
 local function CreateBillboardVisuals(obj, dotSize)
 	obj.tex = play:CreateTexture(nil, "OVERLAY")
-	if obj.texturePath then
-		-- Custom pixel-art sprite shipped with the addon (Interface\AddOns\WoWDoom\textures).
-		-- SetVertexColor-based distance shading (in UpdateBillboard) works the same
-		-- way on a real texture as it does on a flat SetColorTexture square.
-		obj.tex:SetTexture(obj.texturePath)
-	else
-		obj.tex:SetColorTexture(obj.color[1], obj.color[2], obj.color[3])
-	end
+	obj.tex:SetTexture(obj.texturePath)
 	obj.miniDot = minimap:CreateTexture(nil, "OVERLAY")
 	obj.miniDot:SetSize(dotSize, dotSize)
 	obj.miniDot:SetColorTexture(obj.color[1], obj.color[2], obj.color[3])
@@ -256,41 +324,14 @@ local function PositionMiniDot(obj, dotSize)
 		(obj.x / CELL) * MINI_SCALE - dotSize / 2, -(obj.y / CELL) * MINI_SCALE - dotSize / 2)
 end
 
-for _, sprite in ipairs(SPRITES) do
-	CreateBillboardVisuals(sprite, 4)
-	PositionMiniDot(sprite, 4)
+local function DestroyBillboard(obj)
+	obj.tex:Hide()
+	obj.miniDot:Hide()
 end
 
--- ===== Enemies: chase the player, deal contact damage, die to gunfire. =====
-local ENEMIES = {
-	{ x = (5 + 0.5) * CELL, y = (6 + 0.5) * CELL, color = { 0.75, 0.1, 0.65 } },
-	{ x = (7 + 0.5) * CELL, y = (8 + 0.5) * CELL, color = { 0.75, 0.1, 0.65 } },
-	{ x = (5 + 0.5) * CELL, y = (9 + 0.5) * CELL, color = { 0.75, 0.1, 0.65 } },
-}
--- Enemy sprite is Freedoom TROOA1 (the "imp" slot's monster - Freedoom uses original
--- creature designs, not id Software's actual Imp), 48x60 source pixels.
-local ENEMY_TEXTURE = "Interface\\AddOns\\WoWDoom\\textures\\creature.tga"
-local ENEMY_ASPECT = 48 / 60
-
-for _, enemy in ipairs(ENEMIES) do
-	enemy.scale = 0.85
-	enemy.texturePath = ENEMY_TEXTURE
-	enemy.aspect = ENEMY_ASPECT
-	enemy.hp = ENEMY_MAX_HP
-	enemy.dead = false
-	enemy.hitFlash = 0
-	enemy.spawnX, enemy.spawnY = enemy.x, enemy.y
-	CreateBillboardVisuals(enemy, 5)
-	PositionMiniDot(enemy, 5)
-end
-
--- All billboarded objects together, so they can be depth-sorted as one set -
--- otherwise an enemy would always paint over a torch (or vice versa) regardless
--- of which is actually closer, since WoW draws same-layer textures in creation
--- order by default, not by distance.
+local SPRITES = {}
+local ENEMIES = {}
 local ALL_BILLBOARDS = {}
-for _, sprite in ipairs(SPRITES) do tinsert(ALL_BILLBOARDS, sprite) end
-for _, enemy in ipairs(ENEMIES) do tinsert(ALL_BILLBOARDS, enemy) end
 
 local function NormalizeAngle(a)
 	a = a % (2 * math.pi)
@@ -388,8 +429,8 @@ local function UpdateBillboard(obj, halfFov)
 		return
 	end
 
-	local height = min(PLAY_H, (CELL * PLAY_H) / (dist + 1)) * (obj.scale or SPRITE_SCALE)
-	local width = height * (obj.aspect or 1)
+	local height = min(PLAY_H, (CELL * PLAY_H) / (dist + 1)) * obj.scale
+	local width = height * obj.aspect
 	obj.tex:SetSize(width, height)
 	obj.tex:ClearAllPoints()
 	obj.tex:SetPoint("CENTER", play, "BOTTOMLEFT", fraction * PLAY_W, PLAY_H / 2)
@@ -432,6 +473,67 @@ local function UpdateEnemyAI(enemy, elapsed)
 	end
 
 	PositionMiniDot(enemy, 5)
+end
+
+-- ===== Level load: (re)builds the map, minimap, torches, and enemies for a level.
+-- Also used to restart the current level on death - one code path for both. =====
+local function LoadLevel(index)
+	local def = LEVELS[index]
+	currentLevelIndex = index
+
+	for _, obj in ipairs(ALL_BILLBOARDS) do DestroyBillboard(obj) end
+	ClearArray(SPRITES)
+	ClearArray(ENEMIES)
+	ClearArray(ALL_BILLBOARDS)
+
+	MAP_W, MAP_H = #def.mapRows[1], #def.mapRows
+	MAP = {}
+	for y = 1, MAP_H do
+		MAP[y] = {}
+		for x = 1, MAP_W do
+			local ch = def.mapRows[y]:sub(x, x)
+			MAP[y][x] = (ch == "1") and 1 or 0
+			if ch == "2" then
+				levelExitX, levelExitY = (x - 1 + 0.5) * CELL, (y - 1 + 0.5) * CELL
+			end
+		end
+	end
+	RebuildMinimap()
+
+	for _, pos in ipairs(def.torchSpawns) do
+		local sprite = {
+			x = (pos[1] + 0.5) * CELL, y = (pos[2] + 0.5) * CELL,
+			color = TORCH_DOT_COLOR, texturePath = TORCH_TEXTURE,
+			aspect = TORCH_ASPECT, scale = TORCH_SCALE,
+		}
+		CreateBillboardVisuals(sprite, 4)
+		PositionMiniDot(sprite, 4)
+		tinsert(SPRITES, sprite)
+		tinsert(ALL_BILLBOARDS, sprite)
+	end
+
+	for _, pos in ipairs(def.enemySpawns) do
+		local enemy = {
+			x = (pos[1] + 0.5) * CELL, y = (pos[2] + 0.5) * CELL,
+			color = ENEMY_DOT_COLOR, texturePath = ENEMY_TEXTURE,
+			aspect = ENEMY_ASPECT, scale = ENEMY_SCALE,
+			hp = ENEMY_MAX_HP, dead = false, hitFlash = 0,
+		}
+		enemy.spawnX, enemy.spawnY = enemy.x, enemy.y
+		CreateBillboardVisuals(enemy, 5)
+		PositionMiniDot(enemy, 5)
+		tinsert(ENEMIES, enemy)
+		tinsert(ALL_BILLBOARDS, enemy)
+	end
+
+	playerX, playerY = (def.playerStart[1] + 0.5) * CELL, (def.playerStart[2] + 0.5) * CELL
+	playerAngle = def.playerStart[3] or 0
+	playerHP = PLAYER_MAX_HP
+	UpdateHPBar()
+	levelText:SetText(("Level %d / %d"):format(index, #LEVELS))
+
+	HideOverlay()
+	gameState = "playing"
 end
 
 frame:SetScript("OnUpdate", function(self, elapsed)
@@ -480,8 +582,18 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 	if playerHP <= 0 then
 		playerHP = 0
 		gameState = "dead"
-		deathMsg:Show()
-		deathSubMsg:Show()
+		ShowOverlay("You Died", "Click or press Space to retry")
+	else
+		local ex, ey = playerX - levelExitX, playerY - levelExitY
+		if (ex * ex + ey * ey) ^ 0.5 < EXIT_RADIUS then
+			if currentLevelIndex < #LEVELS then
+				gameState = "levelcomplete"
+				ShowOverlay("Level Complete", "Click or press Space to continue")
+			else
+				gameState = "won"
+				ShowOverlay("You Win", "Click or press Space to play again")
+			end
+		end
 	end
 	UpdateHPBar()
 
@@ -507,7 +619,7 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		(playerX / CELL) * MINI_SCALE, -(playerY / CELL) * MINI_SCALE)
 end)
 
--- ===== Shooting & respawn =====
+-- ===== Shooting & continue (dead/levelcomplete/won all resolve via one input) =====
 local function Shoot()
 	if gameState ~= "playing" or shootCooldown > 0 then return end
 	shootCooldown = SHOOT_COOLDOWN
@@ -540,26 +652,19 @@ local function Shoot()
 	end
 end
 
-local function Respawn()
-	playerX, playerY = PLAYER_START_X, PLAYER_START_Y
-	playerAngle = 0
-	playerHP = PLAYER_MAX_HP
-	for _, enemy in ipairs(ENEMIES) do
-		enemy.hp = ENEMY_MAX_HP
-		enemy.dead = false
-		enemy.hitFlash = 0
-		enemy.x, enemy.y = enemy.spawnX, enemy.spawnY
-		enemy.miniDot:Show()
+local function HandleContinueOrShoot()
+	if gameState == "dead" then
+		LoadLevel(currentLevelIndex)
+	elseif gameState == "levelcomplete" then
+		LoadLevel(currentLevelIndex + 1)
+	elseif gameState == "won" then
+		LoadLevel(1)
+	else
+		Shoot()
 	end
-	UpdateHPBar()
-	deathMsg:Hide()
-	deathSubMsg:Hide()
-	gameState = "playing"
 end
 
-play:SetScript("OnMouseDown", function()
-	if gameState == "dead" then Respawn() else Shoot() end
-end)
+play:SetScript("OnMouseDown", HandleContinueOrShoot)
 
 -- ===== Input =====
 local KEY_MAP = {
@@ -575,7 +680,7 @@ frame:SetScript("OnKeyDown", function(self, key)
 		held[action] = true
 		self:SetPropagateKeyboardInput(false)
 	elseif key == "SPACE" then
-		if gameState == "dead" then Respawn() else Shoot() end
+		HandleContinueOrShoot()
 		self:SetPropagateKeyboardInput(false)
 	elseif key == "ESCAPE" then
 		self:Hide()
@@ -613,3 +718,5 @@ SlashCmdList.WOWDOOM = function()
 		frame:Show()
 	end
 end
+
+LoadLevel(1)
