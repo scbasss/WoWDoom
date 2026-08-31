@@ -228,7 +228,14 @@ local SPRITES = {
 }
 local function CreateBillboardVisuals(obj, dotSize)
 	obj.tex = play:CreateTexture(nil, "OVERLAY")
-	obj.tex:SetColorTexture(obj.color[1], obj.color[2], obj.color[3])
+	if obj.texturePath then
+		-- Custom pixel-art sprite shipped with the addon (Interface\AddOns\WoWDoom\textures).
+		-- SetVertexColor-based distance shading (in UpdateBillboard) works the same
+		-- way on a real texture as it does on a flat SetColorTexture square.
+		obj.tex:SetTexture(obj.texturePath)
+	else
+		obj.tex:SetColorTexture(obj.color[1], obj.color[2], obj.color[3])
+	end
 	obj.miniDot = minimap:CreateTexture(nil, "OVERLAY")
 	obj.miniDot:SetSize(dotSize, dotSize)
 	obj.miniDot:SetColorTexture(obj.color[1], obj.color[2], obj.color[3])
@@ -252,7 +259,8 @@ local ENEMIES = {
 	{ x = (5 + 0.5) * CELL, y = (9 + 0.5) * CELL, color = { 0.75, 0.1, 0.65 } },
 }
 for _, enemy in ipairs(ENEMIES) do
-	enemy.scale = 0.6
+	enemy.scale = 0.7
+	enemy.texturePath = "Interface\\AddOns\\WoWDoom\\textures\\imp.tga"
 	enemy.hp = ENEMY_MAX_HP
 	enemy.dead = false
 	enemy.hitFlash = 0
