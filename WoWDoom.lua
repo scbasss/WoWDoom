@@ -32,6 +32,16 @@ local TURN_SPEED       = 2.6         -- radians / sec
 local PLAYER_RADIUS    = 12
 local EXIT_RADIUS      = CELL * 0.6
 
+-- Vertical scale: a "full height" wall spans CELL world-units (0 -> CELL), matching
+-- a grid cell's horizontal size for roughly cube-shaped normal rooms - this exactly
+-- reproduces the old fixed-full-height wall math when a sector's floor=0/ceiling=CELL,
+-- so existing uniform-height levels render identically once compiled through the
+-- new multi-sector system.
+local SECTOR_CEILING   = CELL        -- all sectors currently share one ceiling height
+local RAISED_FLOOR     = CELL * 0.5  -- demo raised-platform floor height
+local EYE_HEIGHT       = CELL * 0.5  -- camera height above whichever sector floor the player is standing on
+local MAX_PORTAL_DEPTH = 4           -- max sector crossings rendered per ray (riser/header layers)
+
 local PLAYER_MAX_HP    = 100
 local ENEMY_RADIUS     = 14
 local ENEMY_DETECT_RADIUS = 260
@@ -54,14 +64,16 @@ end
 -- them unrecognizably or rewriting this into a full sector/BSP engine). Structurally
 -- this mirrors how DOOM source ports like ZDoom define progression (a MAPINFO lump
 -- saying which map follows which) - just simple enough to be a plain Lua table.
--- '1' = wall, '0' = open floor, '2' = exit (walkable; reaching it advances the level).
+-- '1' = wall, '0' = open floor, '2' = exit (walkable; reaching it advances the
+-- level), '3' = raised platform (open floor at RAISED_FLOOR height instead of 0 -
+-- proof of concept for real variable-height sectors, approached from the west/north).
 local LEVELS = {
 	{
 		mapRows = {
 			"1111111111111111",
 			"1000000000000001",
 			"1011110111011101",
-			"1010000100010001",
+			"1010333100010001",
 			"1010111101110101",
 			"1000100000000101",
 			"1110101111110101",
@@ -157,59 +169,111 @@ local function IsWall(worldX, worldY)
 	return MAP[cy][cx] == 1
 end
 
--- ===== Grid -> line-segment compiler =====
--- Bridges our hand-built grid mazes onto a real line-segment raycaster (engine
--- v2): instead of stepping cell-to-cell (DDA), the renderer now casts against
--- actual wall *segments*, which is what a genuine sector-based engine needs -
--- arbitrary-angle walls, not just grid-aligned ones. This pass only compiles
--- the SAME axis-aligned geometry our grids already describe (proving the new
--- raycaster is correct against known-good, verified layouts); hand-authored
--- angled rooms are a natural next step once this foundation is confirmed solid.
--- Collision keeps using the grid/IsWall directly - untouched, lower risk.
+-- ===== Grid -> sector/line compiler (engine v3) =====
+-- Bridges our hand-built grid mazes onto a real sector-based raycaster: instead
+-- of one flat height per level, connected same-floor-height cells are flood-
+-- filled into distinct sectors, and boundaries become lines - solid (one side is
+-- a wall) or portals (both sides are sectors, of possibly different heights).
+-- This is a from-scratch reconstruction of DOOM's actual open/closed portal
+-- semantics (confirmed against PrBoom's r_bsp.c: a portal is "closed"/solid if
+-- the neighboring floor is higher - deliberately NOT porting PrBoom's BSP-tree +
+-- solidcol[] traversal itself, since that's a 1993-hardware performance
+-- optimization for avoiding overdraw, not something that changes what's drawn -
+-- our brute-force nearest-hit-per-column already gets the identical correct
+-- result at our scale (dozens of segments), so reconstructing a BSP tree on top
+-- would just be replicating a constraint we don't have).
 --
--- Adjacent same-orientation edges are merged into single longer segments
--- (a straight 10-cell wall becomes 1 segment, not 10) since the raycaster
--- tests every segment against every screen column each frame - fewer, longer
--- segments is a real perf win, not just tidiness (measured ~2.6x fewer
--- segments on our levels).
-local function CompileGridToLines(mapRows)
+-- Collision still uses the grid/IsWall directly (a height difference doesn't
+-- block movement in this pass - matches classic DOOM's step-up behavior closely
+-- enough without needing a max-step-height model yet).
+local function CompileGridToSectors(mapRows)
 	local h, w = #mapRows, #mapRows[1]
-	local function isOpenCell(x, y) -- 0-indexed
+	local FLOOR_HEIGHT_OF = { ["0"] = 0, ["2"] = 0, ["3"] = RAISED_FLOOR }
+
+	local function ch(x, y) -- 0-indexed; out of bounds reads as wall
+		if x < 0 or y < 0 or x >= w or y >= h then return "1" end
+		return mapRows[y + 1]:sub(x + 1, x + 1)
+	end
+
+	-- Flood-fill connected same-floor-height cells into sectors.
+	local cellSector, visited = {}, {}
+	for y = 0, h - 1 do cellSector[y], visited[y] = {}, {} end
+	local sectors = {}
+
+	local NEIGHBOR_OFFSETS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+	for y = 0, h - 1 do
+		for x = 0, w - 1 do
+			local c = ch(x, y)
+			if c == "1" then
+				cellSector[y][x] = false
+			elseif not visited[y][x] then
+				local targetHeight = FLOOR_HEIGHT_OF[c] or 0
+				local sIdx = #sectors + 1
+				sectors[sIdx] = { floor = targetHeight, ceiling = SECTOR_CEILING }
+				local queue, qi = { { x, y } }, 1
+				visited[y][x] = true
+				while qi <= #queue do
+					local cx, cy = queue[qi][1], queue[qi][2]
+					qi = qi + 1
+					cellSector[cy][cx] = sIdx
+					for _, d in ipairs(NEIGHBOR_OFFSETS) do
+						local nx, ny = cx + d[1], cy + d[2]
+						if nx >= 0 and ny >= 0 and nx < w and ny < h and not visited[ny][nx] then
+							local nc = ch(nx, ny)
+							if nc ~= "1" and (FLOOR_HEIGHT_OF[nc] or 0) == targetHeight then
+								visited[ny][nx] = true
+								tinsert(queue, { nx, ny })
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local function sideAt(x, y)
 		if x < 0 or y < 0 or x >= w or y >= h then return false end
-		return mapRows[y + 1]:sub(x + 1, x + 1) ~= "1"
+		return cellSector[y][x]
+	end
+	local function samePair(a1, b1, a2, b2)
+		return (a1 == a2 and b1 == b2) or (a1 == b2 and b1 == a2)
 	end
 
+	-- Boundary edges become lines, merging consecutive edges that divide the
+	-- SAME pair of sectors (a straight wall becomes 1 segment, not N - see perf
+	-- note further down; this also now correctly splits wherever the
+	-- neighboring sector actually changes, e.g. at a platform's edge).
 	local lines = {}
-
-	-- Horizontal edges (north/south-facing wall faces) at each grid line y=0..h
-	for y = 0, h do
-		local runStart = nil
+	for y = 0, h do -- horizontal edges (north/south-facing)
+		local runStart, runA, runB = nil, nil, nil
 		for x = 0, w do
-			local hasEdge = x < w and (isOpenCell(x, y - 1) ~= isOpenCell(x, y))
+			local a = x < w and sideAt(x, y - 1) or false
+			local b = x < w and sideAt(x, y) or false
+			local hasEdge = x < w and a ~= b
 			if hasEdge and not runStart then
-				runStart = x
-			elseif (not hasEdge or x == w) and runStart then
-				tinsert(lines, { runStart * CELL, y * CELL, x * CELL, y * CELL, false })
-				runStart = nil
+				runStart, runA, runB = x, a, b
+			elseif runStart and (not hasEdge or not samePair(a, b, runA, runB)) then
+				tinsert(lines, { runStart * CELL, y * CELL, x * CELL, y * CELL, false, runA, runB })
+				if hasEdge then runStart, runA, runB = x, a, b else runStart = nil end
 			end
 		end
 	end
-
-	-- Vertical edges (east/west-facing wall faces) at each grid line x=0..w
-	for x = 0, w do
-		local runStart = nil
+	for x = 0, w do -- vertical edges (east/west-facing)
+		local runStart, runA, runB = nil, nil, nil
 		for y = 0, h do
-			local hasEdge = y < h and (isOpenCell(x - 1, y) ~= isOpenCell(x, y))
+			local a = y < h and sideAt(x - 1, y) or false
+			local b = y < h and sideAt(x, y) or false
+			local hasEdge = y < h and a ~= b
 			if hasEdge and not runStart then
-				runStart = y
-			elseif (not hasEdge or y == h) and runStart then
-				tinsert(lines, { x * CELL, runStart * CELL, x * CELL, y * CELL, true })
-				runStart = nil
+				runStart, runA, runB = y, a, b
+			elseif runStart and (not hasEdge or not samePair(a, b, runA, runB)) then
+				tinsert(lines, { x * CELL, runStart * CELL, x * CELL, y * CELL, true, runA, runB })
+				if hasEdge then runStart, runA, runB = y, a, b else runStart = nil end
 			end
 		end
 	end
 
-	return lines
+	return lines, sectors, cellSector
 end
 
 -- Ray (origin O, unit direction D) vs. segment (A -> B). Returns distance
@@ -236,26 +300,81 @@ local function RayIntersectSegment(ox, oy, dx, dy, ax, ay, bx, by)
 	return nil
 end
 
-local function CastRayLines(px, py, angle, lines)
+-- Casts through open portals (equal-or-descending floor height) instead of
+-- stopping at the first line, up to MAX_PORTAL_DEPTH sector crossings, so you
+-- can see through doorways into adjacent same/lower-height rooms - exactly
+-- DOOM's "open" case. An ascending-floor portal (a platform ahead) is treated
+-- as closed FROM THIS SIDE and rendered as the step's riser face (this is the
+-- one deliberate simplification vs. real DOOM: we draw either the riser OR the
+-- far wall beyond it, never both composited in one column - true multi-layer
+-- per-column compositing, plus per-sector floor/ceiling shading (visplanes),
+-- are the remaining pieces if we ever want to go further than this).
+local function CastRayLines(px, py, angle, lines, sectors, startSectorIdx)
 	local dirX, dirY = cos(angle), sin(angle)
-	local bestDist, bestLine = MAX_RENDER_DIST, nil
-	for _, line in ipairs(lines) do
-		local t = RayIntersectSegment(px, py, dirX, dirY, line[1], line[2], line[3], line[4])
-		if t and t < bestDist then
-			bestDist = t
-			bestLine = line
+	local ox, oy = px, py
+	local traveled = 0
+	local curSectorIdx = startSectorIdx
+
+	for _ = 1, MAX_PORTAL_DEPTH do
+		local bestT, bestLine = MAX_RENDER_DIST, nil
+		for _, line in ipairs(lines) do
+			local t = RayIntersectSegment(ox, oy, dirX, dirY, line[1], line[2], line[3], line[4])
+			if t and t < bestT then
+				bestT, bestLine = t, line
+			end
 		end
+
+		if not bestLine then
+			return MAX_RENDER_DIST, false, 0, sectors[curSectorIdx]
+		end
+
+		-- NOT the "a and b or c" idiom here: bestLine[7] can legitimately be
+		-- `false` (a solid wall), and that idiom silently breaks whenever the
+		-- "true" branch value is itself falsy.
+		local otherIdx
+		if bestLine[6] == curSectorIdx then
+			otherIdx = bestLine[7]
+		else
+			otherIdx = bestLine[6]
+		end
+		local _, wallX = RayIntersectSegment(ox, oy, dirX, dirY, bestLine[1], bestLine[2], bestLine[3], bestLine[4])
+		local totalDist = traveled + bestT
+
+		if not otherIdx then -- solid: one side is a wall
+			return totalDist, bestLine[5], wallX, sectors[curSectorIdx]
+		end
+
+		local nearSector, farSector = sectors[curSectorIdx], sectors[otherIdx]
+		if farSector.floor > nearSector.floor then -- ascending step: closed from this side, draw the riser
+			return totalDist, bestLine[5], wallX, nearSector, farSector.floor
+		end
+
+		-- level or descending: open, keep going into the far sector
+		ox, oy = ox + dirX * (bestT + 0.01), oy + dirY * (bestT + 0.01)
+		traveled = totalDist
+		curSectorIdx = otherIdx
 	end
-	if not bestLine then
-		return MAX_RENDER_DIST, false, 0
-	end
-	local _, wallX = RayIntersectSegment(px, py, dirX, dirY, bestLine[1], bestLine[2], bestLine[3], bestLine[4])
-	return bestDist, bestLine[5], wallX
+
+	return MAX_RENDER_DIST, false, 0, sectors[curSectorIdx]
+end
+
+-- Projects a world-space vertical span [zBottom, zTop] (e.g. a sector's floor to
+-- ceiling, or a riser's floor-to-floor face) to a screen-space center offset and
+-- height, relative to the camera's eye height. Reduces to the old fixed
+-- full-wall math exactly when zBottom=0, zTop=CELL, eyeZ=CELL/2 (the previous
+-- assumption for every wall), so uniform-height levels are unaffected.
+local function ComputeSlice(dist, zBottom, zTop, eyeZ)
+	local proj = PLAY_H / (dist + 1)
+	local mid = (zBottom + zTop) / 2 - eyeZ
+	local centerY = PLAY_H / 2 + mid * proj
+	local height = min(PLAY_H * 4, (zTop - zBottom) * proj)
+	return centerY, height
 end
 
 -- ===== Player / run state =====
 local playerX, playerY, playerAngle = 0, 0, 0
 local playerHP = PLAYER_MAX_HP
+local playerSectorIdx = 1 -- which compiled sector the player currently stands in; drives eye height
 local gameState = "playing" -- playing | dead | levelcomplete | won
 local shootCooldown = 0
 local currentLevelIndex = 1
@@ -367,16 +486,23 @@ end
 -- doesn't depend on the map, so the pool itself (unlike the minimap/sprites/
 -- enemies below) never needs to be rebuilt between levels - only which texture
 -- it samples from changes, set once per level load, not per frame. =====
+-- Columns still only need SetPoint touched when their vertical CENTER actually
+-- moves (dirty-checked, like height/color/texcoord below) - not "anchor once
+-- forever" anymore, since a riser/platform hit or a change in the player's own
+-- eye height (standing on a platform) both shift where a slice sits vertically,
+-- not just how tall it is. Still cheap at NUM_COLUMNS=72.
 local columns = {}
 do
 	local colW = PLAY_W / NUM_COLUMNS
 	for i = 1, NUM_COLUMNS do
 		local col = {}
+		col.x = (i - 0.5) * colW
 		col.tex = play:CreateTexture(nil, "ARTWORK")
 		col.tex:SetWidth(colW + 1) -- +1 avoids hairline seams between columns
-		col.tex:SetPoint("CENTER", play, "BOTTOMLEFT", (i - 0.5) * colW, PLAY_H / 2)
+		col.tex:SetPoint("CENTER", play, "BOTTOMLEFT", col.x, PLAY_H / 2)
 		col.tex:SetHeight(PLAY_H)
 		col.lastH = PLAY_H
+		col.lastCenterYKey = floor((PLAY_H / 2) * 4)
 		col.lastShadeKey = nil
 		col.lastWallXKey = nil
 		columns[i] = col
@@ -499,7 +625,16 @@ local function TryMove(nx, ny)
 end
 
 local zbuffer = {} -- corrected wall distance per column, for sprite/enemy occlusion
-local currentLines = {} -- current level's compiled wall segments; rebuilt by LoadLevel
+local currentLines = {} -- current level's compiled wall/portal segments; rebuilt by LoadLevel
+local currentSectors = {} -- current level's sectors (floor/ceiling per region); rebuilt by LoadLevel
+local currentCellSector -- [y][x] (0-indexed) -> sector index or false for wall; rebuilt by LoadLevel
+
+local function GetSectorAt(worldX, worldY)
+	local cx, cy = floor(worldX / CELL), floor(worldY / CELL)
+	local row = currentCellSector[cy]
+	local idx = row and row[cx]
+	return idx or 1 -- fall back to sector 1 rather than erroring if just outside the grid
+end
 
 -- Renders one billboarded object (torch or enemy) against the current z-buffer.
 -- Shared by SPRITES and ENEMIES so occlusion/sizing math only lives in one place.
@@ -594,7 +729,7 @@ local function LoadLevel(index)
 			end
 		end
 	end
-	currentLines = CompileGridToLines(def.mapRows)
+	currentLines, currentSectors, currentCellSector = CompileGridToSectors(def.mapRows)
 	RebuildMinimap()
 	ceiling:SetColorTexture(unpack(def.ceilingColor))
 	floorTex:SetColorTexture(unpack(def.floorColor))
@@ -635,6 +770,7 @@ local function LoadLevel(index)
 
 	playerX, playerY = (def.playerStart[1] + 0.5) * CELL, (def.playerStart[2] + 0.5) * CELL
 	playerAngle = def.playerStart[3] or 0
+	playerSectorIdx = GetSectorAt(playerX, playerY)
 	playerHP = PLAYER_MAX_HP
 	UpdateHPBar()
 	levelText:SetText(("%s (Level %d / %d)"):format(def.name, index, #LEVELS))
@@ -658,19 +794,34 @@ frame:SetScript("OnUpdate", function(self, elapsed)
 		local nx = playerX + cos(playerAngle) * moveDir * MOVE_SPEED * elapsed
 		local ny = playerY + sin(playerAngle) * moveDir * MOVE_SPEED * elapsed
 		TryMove(nx, ny)
+		playerSectorIdx = GetSectorAt(playerX, playerY)
 	end
+
+	-- Eye height tracks whichever sector the player is currently standing in,
+	-- so a raised platform actually raises the camera - otherwise steps would
+	-- be visible but wouldn't feel like anything when you walked onto one.
+	local eyeZ = currentSectors[playerSectorIdx].floor + EYE_HEIGHT
 
 	local halfFov = FOV / 2
 	for i = 1, NUM_COLUMNS do
 		local col = columns[i]
 		local rayAngle = playerAngle - halfFov + (i - 0.5) * (FOV / NUM_COLUMNS)
-		local correctedDist, sideHit, wallX = CastRayLines(playerX, playerY, rayAngle, currentLines)
+		local correctedDist, sideHit, wallX, hitSector, riserTop =
+			CastRayLines(playerX, playerY, rayAngle, currentLines, currentSectors, playerSectorIdx)
 		zbuffer[i] = correctedDist
-		local wallH = min(PLAY_H, (CELL * PLAY_H) / (correctedDist + 1))
+
+		local zBottom, zTop = hitSector.floor, riserTop or hitSector.ceiling
+		local centerY, wallH = ComputeSlice(correctedDist, zBottom, zTop, eyeZ)
 
 		if wallH ~= col.lastH then
 			col.tex:SetHeight(wallH)
 			col.lastH = wallH
+		end
+		local centerYKey = floor(centerY * 4)
+		if centerYKey ~= col.lastCenterYKey then
+			col.tex:ClearAllPoints()
+			col.tex:SetPoint("CENTER", play, "BOTTOMLEFT", col.x, centerY)
+			col.lastCenterYKey = centerYKey
 		end
 
 		-- Sample a thin vertical strip of the wall texture at the hit point (the
